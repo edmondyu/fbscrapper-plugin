@@ -9,11 +9,28 @@
     <h1>FB Post Scraper</h1>
     <div class="stats">
       <span id="count">0</span> posts scraped
+      <div id="dlProgress" class="dl-progress"></div>
     </div>
     <div class="controls">
-      <button id="toggleBtn" class="btn btn-start">Start Scraping</button>
+      <div class="btn-row">
+        <button id="toggleBtn" class="btn btn-start">Start</button>
+        <button id="stopBtn" class="btn btn-stop" style="display:none">Stop</button>
+      </div>
       <button id="exportBtn" class="btn btn-export">Export JSON</button>
+      <button id="exportSafeBtn" class="btn btn-export-safe">Export Sanitized</button>
+      <button id="retryBtn" class="btn btn-retry" style="display:none">Retry Failed</button>
       <button id="clearBtn" class="btn btn-clear">Clear All</button>
+    </div>
+    <div class="name-strip">
+      <label>Strip name from export:</label>
+      <div class="name-row">
+        <span id="detectedName" class="detected-name">—</span>
+        <button id="detectNameBtn" class="btn btn-save-name">Detect</button>
+      </div>
+      <div class="name-row" style="margin-top:4px">
+        <input id="nameInput" type="text" placeholder="Manual override (optional)">
+        <button id="saveNameBtn" class="btn btn-save-name">Save</button>
+      </div>
     </div>
     <div id="status" class="status"></div>
   </div>

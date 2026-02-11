@@ -3,7 +3,7 @@
   "name": "Facebook Post Scraper",
   "version": "1.0.0",
   "description": "Scrape Facebook post content while scrolling through your feed",
-  "permissions": ["storage", "activeTab"],
+  "permissions": ["storage", "activeTab", "downloads"],
   "background": {
     "service_worker": "background.js"
   },

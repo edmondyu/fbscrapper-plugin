@@ -37,6 +37,12 @@ h1 {
   color: #1877f2;
 }
 
+.dl-progress {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #65676b;
+}
+
 .controls {
   display: flex;
   flex-direction: column;
@@ -57,17 +63,41 @@ h1 {
   opacity: 0.85;
 }
 
+.btn-row {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-row .btn {
+  flex: 1;
+}
+
 .btn-start {
   background: #42b72a;
   color: #fff;
 }
 
 .btn-start.active {
+  background: #f0ad4e;
+}
+
+.btn-stop {
   background: #e4405f;
+  color: #fff;
 }
 
 .btn-export {
   background: #1877f2;
+  color: #fff;
+}
+
+.btn-export-safe {
+  background: #00a884;
+  color: #fff;
+}
+
+.btn-retry {
+  background: #f0ad4e;
   color: #fff;
 }
 
@@ -79,6 +109,48 @@ h1 {
 .btn-clear.btn-confirm {
   background: #e4405f;
   color: #fff;
+}
+
+.name-strip {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #65676b;
+}
+
+.name-strip label {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.name-row {
+  display: flex;
+  gap: 6px;
+}
+
+.name-row input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.detected-name {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: #1c1e21;
+  background: #fff;
+  border-radius: 4px;
+  border: 1px solid #ddd;
+  line-height: 1.5;
+}
+
+.btn-save-name {
+  background: #e4e6eb;
+  color: #1c1e21;
+  padding: 6px 10px;
+  font-size: 11px;
 }
 
 .status {
