@@ -105,10 +105,37 @@
       // A post container typically has many direct children (header, body,
       // action bar, reactions, comments section, etc.)
       if (p.children.length >= 10 && p.innerText.length > 100) {
+        // Skip non-post containers that match the size heuristic
+        if (isNonPostContainer(p)) continue;
+        // A real post container should have at least one link (author, timestamp, etc.)
+        // Containers with 0 links are likely text-only fragments — keep walking up
+        if (p.querySelector('a[href]') === null) continue;
         return p;
       }
     }
     return null;
+  }
+
+  // Detect containers that are NOT posts (notifications, nav bars, sidebars)
+  // Uses only fast attribute checks — avoids expensive innerText access
+  function isNonPostContainer(el) {
+    // Check aria-label for known non-post sections (fast attribute read)
+    const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+    if (/^(notifications?|chats?|contacts|messenger|bookmarks|shortcuts)$/i.test(ariaLabel)) return true;
+
+    // Check for notification panel markers via direct child text nodes or specific elements
+    if (el.querySelector('[aria-label="Notifications"], [aria-label="通知"], [aria-label="Your notifications"]')) return true;
+
+    // Check first direct child's textContent (cheap — not full innerText)
+    const firstChild = el.firstElementChild;
+    if (firstChild) {
+      const firstText = firstChild.textContent.substring(0, 80).trim();
+      if (/^(your push notifications|你的推播通知|turn on notifications)/i.test(firstText)) return true;
+      // Navigation sidebar: first child is all "Facebook" repeated
+      if (/^(Facebook\s*){5,}/.test(firstText)) return true;
+    }
+
+    return false;
   }
 
   // Click "See more" links within a container
@@ -282,7 +309,7 @@
 
     // Permalink URL patterns
     const PERMALINK_PATTERNS = [
-      '/posts/', '/permalink/', 'story_fbid', '/photos/',
+      '/posts/', '/permalink/', 'story_fbid', '/photos/', '/photo/',
       '/videos/', '/reel/', 'pfbid',
     ];
 
