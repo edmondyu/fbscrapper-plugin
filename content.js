@@ -14,6 +14,7 @@
   const MAX_AUTO_RETRY = 5; // Auto-retry up to 5 times before truly stopping
   const AUTO_RETRY_DELAY = 5000; // Wait 5 seconds before retrying
   const processedHashes = new Set();
+  const processedPermalinks = new Map(); // permalink -> text length of best capture
   const SCAN_INTERVAL = 2000;
   const SCROLL_INTERVAL = 2500;
 
@@ -22,7 +23,8 @@
     if (loggedInUserName) return loggedInUserName;
 
     // Method 1: Profile link in navigation (aria-label="Your profile")
-    const profileLink = document.querySelector('a[aria-label="Your profile"], a[aria-label="你的個人檔案"], a[aria-label="你的个人主页"]');
+    // Facebook renders this as <a> on home feed but <div> on Page timelines
+    const profileLink = document.querySelector('[aria-label="Your profile"], [aria-label="你的個人檔案"], [aria-label="你的个人主页"]');
     if (profileLink) {
       // The text inside, or the image alt, or the nearby span
       const img = profileLink.querySelector('img');
@@ -48,6 +50,20 @@
                     label.match(/(.+)，在想些什么？/);
       if (match && match[1]) {
         loggedInUserName = match[1].trim();
+        persistUserName(loggedInUserName);
+        return loggedInUserName;
+      }
+    }
+
+    // Method 3: Search page's inline <script> tags for viewer data
+    // Facebook embeds the logged-in user's name in JSON data within script elements
+    const scripts = document.querySelectorAll('script');
+    for (const s of scripts) {
+      const text = s.textContent || '';
+      if (text.length < 50) continue;
+      const m = text.match(/"viewer"\s*:\s*\{[^}]*?"name"\s*:\s*"([^"]{2,50})"/);
+      if (m && m[1]) {
+        loggedInUserName = m[1].trim();
         persistUserName(loggedInUserName);
         return loggedInUserName;
       }
@@ -94,26 +110,47 @@
   }
 
   // Walk up from a text element to find its post container.
-  // The post container is identified as the ancestor div with many children
-  // (Facebook wraps each post in a div with 15+ child elements for
-  // header, content, reactions, comments, etc.)
+  // Facebook uses a virtualized feed (data-virtualized attribute) where each
+  // direct child is one post.  We stop just below that boundary so each post
+  // gets its own container.  For pages without virtualization we fall back to
+  // the original "many children" heuristic.
   function findPostContainer(el) {
     let p = el;
+    let lastCandidate = null;
     for (let i = 0; i < 20; i++) {
       p = p.parentElement;
-      if (!p || p === document.body) return null;
-      // A post container typically has many direct children (header, body,
-      // action bar, reactions, comments section, etc.)
+      if (!p || p === document.body) break;
+
+      // If the parent is a virtualized feed container, p is a direct feed
+      // child — return it (or the best candidate found so far inside it)
+      if (p.parentElement && p.parentElement.hasAttribute('data-virtualized')) {
+        return lastCandidate || p;
+      }
+
+      // Original heuristic: container with many children
       if (p.children.length >= 10 && p.innerText.length > 100) {
-        // Skip non-post containers that match the size heuristic
         if (isNonPostContainer(p)) continue;
-        // A real post container should have at least one link (author, timestamp, etc.)
-        // Containers with 0 links are likely text-only fragments — keep walking up
         if (p.querySelector('a[href]') === null) continue;
-        return p;
+        // If we already found a good post-like candidate closer to the
+        // text element, prefer it over this larger container (which is
+        // likely a page-level wrapper, not an individual post)
+        return lastCandidate || p;
+      }
+
+      // Track the best post-like container as we walk up.
+      // A post container has 3+ children, a link, some text, and an author
+      // indicator (heading OR strong tag — Facebook uses different elements
+      // for different posts on the same page).
+      if (p.children.length >= 3 && p.querySelector('a[href]') && p.innerText.length > 20) {
+        const hasAuthor = p.querySelector('h2, h3, h4, h5, h6, strong');
+        if (hasAuthor) {
+          if (!lastCandidate || p.children.length > lastCandidate.children.length) {
+            lastCandidate = p;
+          }
+        }
       }
     }
-    return null;
+    return lastCandidate || null;
   }
 
   // Detect containers that are NOT posts (notifications, nav bars, sidebars)
@@ -138,27 +175,43 @@
     return false;
   }
 
+  // Text patterns that match "See more" buttons in various languages
+  const SEE_MORE_TEXTS = new Set([
+    'see more', 'see more…', '...see more', '… see more',
+    '顯示更多', '查看更多', '展開',
+  ]);
+
   // Click "See more" links within a container
   function clickSeeMore(container) {
-    const candidates = container.querySelectorAll(
+    let clicked = false;
+
+    // Strategy 1: elements with interactive attributes (original approach)
+    const interactive = container.querySelectorAll(
       'div[role="button"], span[role="button"], a[role="link"], span[tabindex="0"], div[tabindex="0"]'
     );
-    let clicked = false;
-    for (const el of candidates) {
+    for (const el of interactive) {
       const text = el.innerText.trim().toLowerCase();
-      if (
-        text === 'see more' ||
-        text === 'see more…' ||
-        text === '...see more' ||
-        text === '… see more' ||
-        text === '顯示更多' ||
-        text === '查看更多' ||
-        text === '展開'
-      ) {
+      if (SEE_MORE_TEXTS.has(text)) {
         el.click();
         clicked = true;
       }
     }
+
+    // Strategy 2: if nothing found, try any leaf element whose only text
+    // is a "See more" pattern (Facebook sometimes omits role/tabindex)
+    if (!clicked) {
+      const allEls = container.querySelectorAll('div, span, a');
+      for (const el of allEls) {
+        if (el.children.length > 1) continue;
+        const text = el.innerText.trim().toLowerCase();
+        if (SEE_MORE_TEXTS.has(text)) {
+          el.click();
+          clicked = true;
+          break; // click only one to avoid side effects
+        }
+      }
+    }
+
     return clicked;
   }
 
@@ -181,10 +234,13 @@
       texts.push(text);
     }
 
-    // Deduplicate: remove texts that are substrings of longer texts
-    const unique = texts.filter((t, i) =>
-      !texts.some((other, j) => j !== i && other.length > t.length && other.includes(t))
-    );
+    // Deduplicate: remove exact duplicates and texts that are substrings of longer texts
+    const unique = texts.filter((t, i) => {
+      // Remove exact duplicates (keep first occurrence only)
+      if (texts.indexOf(t) !== i) return false;
+      // Remove texts that are substrings of longer texts
+      return !texts.some((other, j) => j !== i && other.length > t.length && other.includes(t));
+    });
 
     let postText = unique.join('\n');
 
@@ -574,15 +630,19 @@
       if (seenContainers.has(container)) continue;
       seenContainers.add(container);
 
-      // Skip if already scraped
-      if (container.dataset.fbScraperDone) continue;
+      // Skip if already scraped or already checked (rejected sidebar/non-post)
+      if (container.dataset.fbScraperDone || container.dataset.fbScraperChecked) continue;
 
-      // Skip if this container is inside an already-processed container
+      // Skip if this container is inside an already-scraped post container
       // (prevents duplicate text-only captures from inner elements)
+      // Only check fbScraperDone (confirmed posts), NOT fbScraperChecked (rejected sidebars)
+      // IMPORTANT: ignore large containers (>= 8 children) as nesting boundaries —
+      // these are page-level wrappers, not individual posts. If one was accidentally
+      // marked as done, it must not block all sibling posts inside it.
       let ancestor = container.parentElement;
       let isNested = false;
       while (ancestor && ancestor !== document.body) {
-        if (ancestor.dataset.fbScraperDone) {
+        if (ancestor.dataset.fbScraperDone && ancestor.children.length < 8) {
           isNested = true;
           break;
         }
@@ -603,11 +663,9 @@
   }
 
   function processPost(container) {
-    container.dataset.fbScraperDone = 'true';
-
     // Click "See more" to expand, then extract after delay
     const clicked = clickSeeMore(container);
-    const delay = clicked ? 600 : 0;
+    const delay = clicked ? 800 : 0;
 
     setTimeout(() => {
       // Click again in case expansion revealed more
@@ -618,28 +676,68 @@
 
       if (!postText && !author) {
         console.log('[FB Scraper] Skipped empty container');
+        container.dataset.fbScraperChecked = 'true';
         return;
       }
 
       // Skip non-post content (notifications panel, nav elements, etc.)
-      if (/^(your push notifications|turn on notifications|not now|new see all)/i.test(postText)) {
+      if (/^(your push notifications|turn on notifications|not now|new see all|notifications\n)/i.test(postText)) {
         console.log('[FB Scraper] Skipped notifications panel');
+        container.dataset.fbScraperChecked = 'true';
         return;
       }
-      // Skip if postText is just repeated single words (nav/sidebar noise)
+      if (/notifications?\s*(are\s+)?off/i.test(author)) {
+        console.log('[FB Scraper] Skipped notification header:', author);
+        container.dataset.fbScraperChecked = 'true';
+        return;
+      }
+      if ((postText.match(/\bUnread/gi) || []).length >= 3) {
+        console.log('[FB Scraper] Skipped notification list (multiple Unread entries)');
+        container.dataset.fbScraperChecked = 'true';
+        return;
+      }
+      if (/^(details|contact info|photos|intro|about|friends|videos|reels|check-ins|music|posts)$/i.test(author)) {
+        console.log('[FB Scraper] Skipped sidebar section:', author);
+        container.dataset.fbScraperChecked = 'true';
+        return;
+      }
+      if (/\d+[kK]?\s*likes?\s*[•·]\s*\d+[kK]?\s*followers?/i.test(postText)) {
+        console.log('[FB Scraper] Skipped sidebar (likes/followers pattern)');
+        container.dataset.fbScraperChecked = 'true';
+        return;
+      }
       const lines = postText.split('\n').map(l => l.trim()).filter(l => l);
       const uniqueLines = new Set(lines);
       if (uniqueLines.size <= 2 && lines.length > 3) {
         console.log('[FB Scraper] Skipped repetitive content');
+        container.dataset.fbScraperChecked = 'true';
         return;
       }
 
-      // Deduplicate
+      // Mark container as done so it's not re-processed.
+      if (container.children.length >= 8) {
+        container.dataset.fbScraperChecked = 'true';
+      } else {
+        container.dataset.fbScraperDone = 'true';
+      }
+
+      const { timestamp, permalink } = extractTimestamp(container);
+
+      // Deduplicate by permalink — allow longer text to replace shorter
+      if (permalink && processedPermalinks.has(permalink)) {
+        const prevLen = processedPermalinks.get(permalink);
+        if (postText.length <= prevLen) return;
+        console.log('[FB Scraper] Replacing truncated capture for', permalink,
+          '(', prevLen, '->', postText.length, 'chars)');
+      }
+
+      const isReplacement = permalink && processedPermalinks.has(permalink);
+
       const key = hashString(author + postText);
       if (processedHashes.has(key)) return;
       processedHashes.add(key);
+      if (permalink) processedPermalinks.set(permalink, postText.length);
 
-      const { timestamp, permalink } = extractTimestamp(container);
       const reactions = extractReactions(container);
       const comments = extractComments(container);
       const images = extractImages(container);
@@ -657,8 +755,28 @@
         scrapedAt: new Date().toISOString(),
       };
 
-      chrome.runtime.sendMessage({ type: 'NEW_POST', post });
+      chrome.runtime.sendMessage({ type: isReplacement ? 'REPLACE_POST' : 'NEW_POST', post });
       console.log('[FB Scraper] Captured:', author, '|', postText.substring(0, 40) + '...');
+
+      // If text is short, try expanding asynchronously and replacing
+      if (postText.length < 200 && permalink && !isReplacement) {
+        setTimeout(() => {
+          const retryClicked = clickSeeMore(container);
+          if (retryClicked) {
+            console.log('[FB Scraper] Retry: clicked See more for', permalink);
+            setTimeout(() => {
+              const retryText = extractPostText(container);
+              if (retryText.length > postText.length) {
+                console.log('[FB Scraper] Retry: expanded', postText.length, '->', retryText.length, 'chars');
+                const retryPost = { ...post, postText: retryText, scrapedAt: new Date().toISOString() };
+                processedPermalinks.set(permalink, retryText.length);
+                processedHashes.add(hashString(author + retryText));
+                chrome.runtime.sendMessage({ type: 'REPLACE_POST', post: retryPost });
+              }
+            }, 1000);
+          }
+        }, 2000);
+      }
     }, delay);
   }
 
@@ -670,8 +788,13 @@
           for (const post of res.posts) {
             const key = hashString((post.author || '') + (post.postText || ''));
             processedHashes.add(key);
+            if (post.permalink) {
+              const len = (post.postText || '').length;
+              const prev = processedPermalinks.get(post.permalink) || 0;
+              if (len > prev) processedPermalinks.set(post.permalink, len);
+            }
           }
-          console.log('[FB Scraper] Restored', processedHashes.size, 'hashes from storage');
+          console.log('[FB Scraper] Restored', processedHashes.size, 'hashes,', processedPermalinks.size, 'permalinks from storage');
         }
         resolve();
       });

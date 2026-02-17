@@ -1,6 +1,29 @@
 let isProcessing = false;
 let isPaused = false;
 
+// Serialize post storage writes to prevent race conditions
+const postQueue = [];
+let isStoringPost = false;
+
+async function drainPostQueue() {
+  if (isStoringPost) return;
+  isStoringPost = true;
+  try {
+    while (postQueue.length > 0) {
+      const { post, resolve } = postQueue.shift();
+      const result = await chrome.storage.local.get({ posts: [] });
+      const posts = result.posts;
+      const postIndex = posts.length;
+      posts.push(post);
+      await chrome.storage.local.set({ posts });
+      enqueueImages(postIndex, post.images);
+      resolve({ ok: true, count: posts.length });
+    }
+  } finally {
+    isStoringPost = false;
+  }
+}
+
 // Process the download queue one item at a time
 async function processQueue() {
   if (isProcessing || isPaused) return;
@@ -127,15 +150,32 @@ function getDownloadProgress(downloadQueue) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'NEW_POST') {
+    new Promise((resolve) => {
+      postQueue.push({ post: msg.post, resolve });
+      drainPostQueue();
+    }).then((result) => {
+      sendResponse(result);
+    });
+    return true;
+  }
+
+  if (msg.type === 'REPLACE_POST') {
+    // Replace a previously captured truncated post with an expanded version
     chrome.storage.local.get({ posts: [] }, (result) => {
       const posts = result.posts;
-      const postIndex = posts.length;
-      posts.push(msg.post);
-      chrome.storage.local.set({ posts }, () => {
-        // Enqueue images for download
-        enqueueImages(postIndex, msg.post.images);
-        sendResponse({ ok: true, count: posts.length });
-      });
+      const idx = posts.findIndex(p => p.permalink && p.permalink === msg.post.permalink);
+      if (idx !== -1) {
+        posts[idx] = msg.post;
+        chrome.storage.local.set({ posts }, () => {
+          sendResponse({ ok: true, replaced: true, count: posts.length });
+        });
+      } else {
+        // Permalink not found — treat as new post
+        posts.push(msg.post);
+        chrome.storage.local.set({ posts }, () => {
+          sendResponse({ ok: true, replaced: false, count: posts.length });
+        });
+      }
     });
     return true;
   }

@@ -86,12 +86,12 @@ h1 {
   color: #fff;
 }
 
-.btn-export {
+.btn-export-safe {
   background: #1877f2;
   color: #fff;
 }
 
-.btn-export-safe {
+.btn-export-csv {
   background: #00a884;
   color: #fff;
 }

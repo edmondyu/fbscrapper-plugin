@@ -1,8 +1,8 @@
 const countEl = document.getElementById('count');
 const toggleBtn = document.getElementById('toggleBtn');
 const stopBtn = document.getElementById('stopBtn');
-const exportBtn = document.getElementById('exportBtn');
 const exportSafeBtn = document.getElementById('exportSafeBtn');
+const exportCsvBtn = document.getElementById('exportCsvBtn');
 const clearBtn = document.getElementById('clearBtn');
 const retryBtn = document.getElementById('retryBtn');
 const statusEl = document.getElementById('status');
@@ -206,28 +206,7 @@ function cleanForExport(posts, userName) {
   return cleaned;
 }
 
-// Export posts as JSON
-exportBtn.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ type: 'EXPORT_POSTS' }, (res) => {
-    if (!res || !res.posts || res.posts.length === 0) {
-      statusEl.textContent = 'No posts to export';
-      return;
-    }
-    getStripName((userName) => {
-      const posts = cleanForExport(res.posts, userName);
-      const blob = new Blob([JSON.stringify(posts, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `fb-posts-${new Date().toISOString().slice(0, 10)}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      statusEl.textContent = `Exported ${posts.length} posts`;
-    });
-  });
-});
-
-// Export sanitized posts (session tokens stripped from URLs — safe to share)
+// Export sanitized posts as JSON (session tokens stripped from URLs)
 exportSafeBtn.addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'EXPORT_POSTS' }, (res) => {
     if (!res || !res.posts || res.posts.length === 0) {
@@ -241,10 +220,54 @@ exportSafeBtn.addEventListener('click', () => {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `fb-posts-sanitized-${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = `fb-posts-${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      statusEl.textContent = `Exported ${posts.length} sanitized posts`;
+      statusEl.textContent = `Exported ${posts.length} posts (JSON)`;
+    });
+  });
+});
+
+// Convert posts array to CSV string
+function postsToCSV(posts) {
+  const columns = ['author', 'postText', 'timestamp', 'permalink', 'reactions', 'comments', 'images', 'videos', 'scrapedAt'];
+  function escapeCSV(value) {
+    const str = String(value == null ? '' : value);
+    if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
+      return '"' + str.replace(/"/g, '""') + '"';
+    }
+    return str;
+  }
+  const header = columns.map(escapeCSV).join(',');
+  const rows = posts.map(post =>
+    columns.map(col => {
+      const val = post[col];
+      if (Array.isArray(val)) return escapeCSV(val.join(' '));
+      return escapeCSV(val);
+    }).join(',')
+  );
+  return header + '\n' + rows.join('\n');
+}
+
+// Export sanitized posts as CSV
+exportCsvBtn.addEventListener('click', () => {
+  chrome.runtime.sendMessage({ type: 'EXPORT_POSTS' }, (res) => {
+    if (!res || !res.posts || res.posts.length === 0) {
+      statusEl.textContent = 'No posts to export';
+      return;
+    }
+    getStripName((userName) => {
+      let posts = cleanForExport(res.posts, userName);
+      posts = sanitizePosts(posts);
+      const csv = postsToCSV(posts);
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `fb-posts-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      statusEl.textContent = `Exported ${posts.length} posts (CSV)`;
     });
   });
 });
