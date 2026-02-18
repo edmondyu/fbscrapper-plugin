@@ -11,6 +11,8 @@ const nameInput = document.getElementById('nameInput');
 const saveNameBtn = document.getElementById('saveNameBtn');
 const detectNameBtn = document.getElementById('detectNameBtn');
 const detectedNameEl = document.getElementById('detectedName');
+const dlFolderInput = document.getElementById('dlFolderInput');
+const saveDlFolderBtn = document.getElementById('saveDlFolderBtn');
 
 // Sanitize Facebook CDN URLs by stripping session-specific parameters
 const SESSION_PARAMS = [
@@ -230,7 +232,7 @@ exportSafeBtn.addEventListener('click', () => {
 
 // Convert posts array to CSV string
 function postsToCSV(posts) {
-  const columns = ['author', 'postText', 'timestamp', 'permalink', 'reactions', 'comments', 'images', 'videos', 'scrapedAt'];
+  const columns = ['author', 'postText', 'timestamp', 'permalink', 'reactions', 'comments', 'images', 'videos', 'localFiles', 'scrapedAt'];
   function escapeCSV(value) {
     const str = String(value == null ? '' : value);
     if (str.includes('"') || str.includes(',') || str.includes('\n') || str.includes('\r')) {
@@ -376,6 +378,18 @@ saveNameBtn.addEventListener('click', () => {
 chrome.storage.local.get({ manualStripName: '', loggedInUserName: '' }, (stored) => {
   detectedNameEl.textContent = stored.loggedInUserName || '(not detected yet)';
   nameInput.value = stored.manualStripName || '';
+});
+
+// Download folder setting
+saveDlFolderBtn.addEventListener('click', () => {
+  const folder = dlFolderInput.value.trim() || 'fb-scraper';
+  chrome.storage.local.set({ downloadFolder: folder }, () => {
+    statusEl.textContent = `Download folder set to: "${folder}"`;
+  });
+});
+
+chrome.storage.local.get({ downloadFolder: 'fb-scraper' }, (stored) => {
+  dlFolderInput.value = stored.downloadFolder || 'fb-scraper';
 });
 
 // Initial updates

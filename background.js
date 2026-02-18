@@ -101,7 +101,8 @@ function downloadFile(url, filename) {
 async function enqueueImages(postIndex, images) {
   if (!images || images.length === 0) return;
 
-  const { downloadQueue = [] } = await chrome.storage.local.get('downloadQueue');
+  const { downloadQueue = [], downloadFolder = 'fb-scraper' } = await chrome.storage.local.get(['downloadQueue', 'downloadFolder']);
+  const folder = downloadFolder || 'fb-scraper';
 
   for (let i = 0; i < images.length; i++) {
     const url = images[i];
@@ -118,7 +119,7 @@ async function enqueueImages(postIndex, images) {
       postIndex,
       imageIndex: i,
       url,
-      filename: `fb-scraper/post-${postIndex}-img-${i}.${ext}`,
+      filename: `${folder}/post-${postIndex}-img-${i}.${ext}`,
       status: 'pending',
     });
   }
