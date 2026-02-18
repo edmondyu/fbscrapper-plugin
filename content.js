@@ -660,6 +660,40 @@
     if (found > 0) {
       console.log(`[FB Scraper] Scan found ${found} new post containers`);
     }
+
+    // Second pass: look for dir="auto" elements with substantial text that
+    // the main pipeline missed (findPostContainer returned null because all
+    // ancestors were already marked).  These are posts nested inside another
+    // post's container due to Facebook's DOM structure.
+    for (const el of allDirAuto) {
+      const text = el.innerText.trim();
+      if (text.length < 100) continue;
+      // Only process elements where findPostContainer would return null
+      const container = findPostContainer(el);
+      if (container) continue;  // main pipeline handles this
+      // Check if this text is already captured
+      let alreadyCaptured = false;
+      for (const [, capturedLen] of processedPermalinks) {
+        if (capturedLen >= text.length * 0.5) { alreadyCaptured = true; break; }
+      }
+      if (alreadyCaptured) continue;
+      // Walk up to find the nearest ancestor with an uncaptured permalink
+      let postParent = el;
+      for (let k = 0; k < 20; k++) {
+        postParent = postParent.parentElement;
+        if (!postParent || postParent === document.body) { postParent = null; break; }
+        const link = postParent.querySelector('a[href*="/posts/"], a[href*="/photo/"], a[href*="/videos/"]');
+        if (link) break;
+      }
+      if (!postParent || seenContainers.has(postParent)) continue;
+      // Extract permalink and check if already captured
+      const { permalink } = extractTimestamp(postParent);
+      if (!permalink || processedPermalinks.has(permalink)) continue;
+      // This is a genuinely missed post — process it
+      seenContainers.add(postParent);
+      console.log('[FB Scraper] Processing orphan post:', text.substring(0, 50));
+      processPost(postParent);
+    }
   }
 
   function processPost(container) {
@@ -722,6 +756,16 @@
       }
 
       const { timestamp, permalink } = extractTimestamp(container);
+
+      // Reject non-post content (notifications, footer, comment counts)
+      const trimmedText = postText.trim();
+      if (/^Unread/i.test(trimmedText)) return;
+      if (/^\d+\s*comments?$/i.test(trimmedText)) return;
+      if (/^(· Privacy|Privacy\s+·\s+Terms)/i.test(trimmedText)) return;
+      if (/^\d+% recommend\b/i.test(trimmedText)) return;
+      if (/^Details\b/i.test(trimmedText) && /\b(recommend|contact info|privacy|terms)\b/i.test(trimmedText)) return;
+      if (/\b(added to (?:his|her|their) story)\b/i.test(trimmedText) && trimmedText.length < 100) return;
+      if (/\b(sent messages? to)\b/i.test(trimmedText) && trimmedText.length < 100) return;
 
       // Deduplicate by permalink — allow longer text to replace shorter
       if (permalink && processedPermalinks.has(permalink)) {
@@ -841,7 +885,7 @@
       }
 
       // Scroll further when stalling
-      const scrollAmount = stallCount > 5 ? 1500 : 800;
+      const scrollAmount = stallCount > 5 ? 800 : 400;
       window.scrollBy({ top: scrollAmount, behavior: 'smooth' });
     }, SCROLL_INTERVAL);
   }

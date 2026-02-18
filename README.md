@@ -109,6 +109,27 @@ The **sanitized** export additionally strips session-specific CDN parameters (`_
 - Export-time cleaning pipeline: name stripping, artifact removal, deduplication
 - Name detection UI (auto-detected + manual override)
 
+## Known Issues & Technical Notes
+
+### Facebook's Virtualized Feed
+Facebook uses a **virtualized feed** that only keeps visible posts in the DOM. Posts scrolled out of view are removed from the DOM entirely, making it impossible to scrape them after they leave the viewport. Key implications:
+
+- **Scroll speed matters**: The auto-scroll increment is tuned (400px normal, 800px when stalling) to keep posts in the DOM long enough for the scanner to process them. Larger scroll amounts cause posts to flash through the viewport too quickly.
+- **Posts must be visible**: A post that was never scrolled into view will never appear in the DOM and cannot be scraped.
+- **DOM node recycling**: Facebook reuses the same DOM nodes for different posts. The scraper uses permalink fingerprinting to detect recycled nodes and clear stale marks.
+
+### Shared Container Problem
+On Facebook Pages, adjacent posts by the same author can share a common DOM ancestor. The scraper's `findPostContainer()` walks up from text elements to find post boundaries, but sometimes two posts resolve to the same container. When the first post marks the container as "done", the second post's text elements become orphaned (no valid container).
+
+**Current solution**: A two-pass scan approach:
+1. **Main pass**: Standard `findPostContainer()` pipeline — works for most posts
+2. **Orphan pass**: After the main scan, looks for `dir="auto"` elements with 100+ characters of uncaptured text where `findPostContainer()` returned null. Walks up to find the nearest ancestor with an uncaptured permalink and processes it through `processPost()`.
+
+This approach captures posts that would otherwise be missed without interfering with the main pipeline's behavior.
+
+### Post-Extraction Garbage Filtering
+Facebook pages contain many non-post elements (notifications, footer text, comment counts, page info) that can slip through container detection. The scraper filters these at the extraction stage by rejecting text matching patterns like notification items (`Unread...`), comment counts (`N comments`), footer text (`Privacy · Terms`), and page details (`Details ... recommend`).
+
 ## Limitations
 
 - Only works on `https://www.facebook.com/*`
@@ -117,6 +138,8 @@ The **sanitized** export additionally strips session-specific CDN parameters (`_
 - Facebook DOM structure may change, which could break selectors
 - Timestamp extraction depends on Facebook's DOM patterns; some posts may have missing timestamps depending on the page layout
 - Auto-scroll may stall on very long timelines; the extension auto-retries but may eventually stop
+- **Photo-only posts** (no text content) may be skipped since the scraper relies on `dir="auto"` text elements for post detection
+- **Posts deep in the feed** may be missed if Facebook's virtualized feed removes them from the DOM before the scanner processes them
 
 ## License
 
