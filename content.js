@@ -620,7 +620,7 @@
       if (text.length < 8) continue;
       // Skip known UI patterns
       if (/^(switch into|you're commenting|manage|boost this|write a comment)/i.test(text)) continue;
-      if (/^(like|comment|share|send|reply|follow|sponsored)$/i.test(text)) continue;
+      if (/^(like|comment|share|send|reply|follow|sponsored|facebook)$/i.test(text)) continue;
 
       // Find the post container for this text element
       const container = findPostContainer(el);
@@ -705,8 +705,15 @@
       // Click again in case expansion revealed more
       if (clicked) clickSeeMore(container);
 
-      const postText = extractPostText(container);
+      let postText = extractPostText(container);
       const author = extractAuthor(container);
+
+      // Safeguard: trim extremely long posts to prevent performance issues
+      const MAX_POST_LENGTH = 10000;
+      if (postText && postText.length > MAX_POST_LENGTH) {
+        console.warn('[FB Scraper] Post text extremely long (' + postText.length + ' chars), trimming to ' + MAX_POST_LENGTH);
+        postText = '[attention: post text too long, content is trimmed] ' + postText.substring(0, MAX_POST_LENGTH);
+      }
 
       if (!postText && !author) {
         console.log('[FB Scraper] Skipped empty container');
@@ -809,7 +816,11 @@
           if (retryClicked) {
             console.log('[FB Scraper] Retry: clicked See more for', permalink);
             setTimeout(() => {
-              const retryText = extractPostText(container);
+              let retryText = extractPostText(container);
+              if (retryText.length > MAX_POST_LENGTH) {
+                console.warn('[FB Scraper] Retry text extremely long (' + retryText.length + ' chars), trimming to ' + MAX_POST_LENGTH);
+                retryText = '[attention: post text too long, content is trimmed] ' + retryText.substring(0, MAX_POST_LENGTH);
+              }
               if (retryText.length > postText.length) {
                 console.log('[FB Scraper] Retry: expanded', postText.length, '->', retryText.length, 'chars');
                 const retryPost = { ...post, postText: retryText, scrapedAt: new Date().toISOString() };
@@ -844,6 +855,32 @@
       });
     });
   }
+
+  // Detect large scroll jumps from Facebook's virtualization.
+  // When a forward jump > 800px is detected, immediately scan to catch
+  // posts that may be briefly visible, then scroll back so the normal
+  // scroll can re-traverse the skipped area.
+  let _prevScrollY = window.scrollY;
+  let _scrollBackTarget = -1;
+  window.addEventListener('scroll', () => {
+    if (!isActive) { _prevScrollY = window.scrollY; return; }
+    const curY = window.scrollY;
+    const delta = curY - _prevScrollY;
+    if (delta > 800) {
+      // Large forward jump — scan immediately and schedule a scroll-back
+      console.log('[FB Scraper] Scroll jump +' + delta + ', scanning & scrolling back');
+      scanForPosts();
+      _scrollBackTarget = _prevScrollY;
+      // Use requestAnimationFrame to scroll back after the browser settles
+      requestAnimationFrame(() => {
+        if (_scrollBackTarget >= 0) {
+          window.scrollTo({ top: _scrollBackTarget, behavior: 'instant' });
+          _scrollBackTarget = -1;
+        }
+      });
+    }
+    _prevScrollY = curY;
+  }, { passive: true });
 
   function startAutoScroll() {
     if (autoScrollInterval) return;
@@ -884,9 +921,8 @@
         }
       }
 
-      // Scroll further when stalling
-      const scrollAmount = stallCount > 5 ? 800 : 400;
-      window.scrollBy({ top: scrollAmount, behavior: 'smooth' });
+      // Constant scroll speed — avoid acceleration that skips posts
+      window.scrollBy({ top: 400, behavior: 'smooth' });
     }, SCROLL_INTERVAL);
   }
 
