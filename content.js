@@ -10,13 +10,14 @@
   let lastDocHeight = 0;
   let autoRetryCount = 0;
   let loggedInUserName = '';
-  const MAX_STALL = 8; // Pause auto-scroll after 8 intervals with no new posts
+  const MAX_STALL = 6; // Pause auto-scroll after 6 intervals with no new posts
   const MAX_AUTO_RETRY = 5; // Auto-retry up to 5 times before truly stopping
-  const AUTO_RETRY_DELAY = 5000; // Wait 5 seconds before retrying
+  const AUTO_RETRY_DELAY = 3000; // Wait 3 seconds before retrying
   const processedHashes = new Set();
   const processedPermalinks = new Map(); // permalink -> text length of best capture
-  const SCAN_INTERVAL = 2000;
-  const SCROLL_INTERVAL = 2500;
+  const processedPrefixes = new Map(); // hash(author + first 40 chars) -> { textLength, hash }
+  const SCAN_INTERVAL = 1200;
+  const SCROLL_INTERVAL = 1500;
 
   // Detect the logged-in user's display name from Facebook's UI
   function detectLoggedInUser() {
@@ -378,8 +379,22 @@
     function cleanPermalink(link) {
       try {
         const url = new URL(link.href, 'https://www.facebook.com');
+        // Preserve identifying query params (fbid, story_fbid, v) before stripping
+        const fbid = url.searchParams.get('fbid');
+        const storyFbid = url.searchParams.get('story_fbid');
+        const videoId = url.searchParams.get('v');
         url.search = '';
-        return url.toString();
+        // Re-add identifying params so the permalink remains unique
+        if (fbid) url.searchParams.set('fbid', fbid);
+        if (storyFbid) url.searchParams.set('story_fbid', storyFbid);
+        if (videoId) url.searchParams.set('v', videoId);
+        const cleaned = url.toString();
+        // Reject generic paths that aren't unique identifiers
+        // e.g. "https://www.facebook.com/photo/" with no fbid
+        if (/\/(photo|photos|videos)\/?$/.test(url.pathname) && !fbid && !storyFbid) {
+          return '';
+        }
+        return cleaned;
       } catch {
         return link.href;
       }
@@ -609,29 +624,32 @@
 
   // Find all post text elements on the page and process their containers
   function scanForPosts() {
+    if (!isActive) return;
     // Find all dir="auto" elements with meaningful text content
     const allDirAuto = document.querySelectorAll('div[dir="auto"], span[dir="auto"]');
     const seenContainers = new Set();
 
     let found = 0;
+    let skipReasons = { short: 0, ui: 0, noContainer: 0, seen: 0, done: 0, checked: 0, nested: 0 };
     for (const el of allDirAuto) {
       const text = el.innerText.trim();
       // Must have some real content (not just UI labels)
-      if (text.length < 8) continue;
+      if (text.length < 8) { skipReasons.short++; continue; }
       // Skip known UI patterns
-      if (/^(switch into|you're commenting|manage|boost this|write a comment)/i.test(text)) continue;
-      if (/^(like|comment|share|send|reply|follow|sponsored|facebook)$/i.test(text)) continue;
+      if (/^(switch into|you're commenting|manage|boost this|write a comment)/i.test(text)) { skipReasons.ui++; continue; }
+      if (/^(like|comment|share|send|reply|follow|sponsored|facebook)$/i.test(text)) { skipReasons.ui++; continue; }
 
       // Find the post container for this text element
       const container = findPostContainer(el);
-      if (!container) continue;
+      if (!container) { skipReasons.noContainer++; continue; }
 
       // Skip if already processed this container in this scan
-      if (seenContainers.has(container)) continue;
+      if (seenContainers.has(container)) { skipReasons.seen++; continue; }
       seenContainers.add(container);
 
       // Skip if already scraped or already checked (rejected sidebar/non-post)
-      if (container.dataset.fbScraperDone || container.dataset.fbScraperChecked) continue;
+      if (container.dataset.fbScraperDone) { skipReasons.done++; continue; }
+      if (container.dataset.fbScraperChecked) { skipReasons.checked++; continue; }
 
       // Skip if this container is inside an already-scraped post container
       // (prevents duplicate text-only captures from inner elements)
@@ -650,6 +668,7 @@
       }
       if (isNested) {
         container.dataset.fbScraperDone = 'true';
+        skipReasons.nested++;
         continue;
       }
 
@@ -658,7 +677,24 @@
     }
 
     if (found > 0) {
-      console.log(`[FB Scraper] Scan found ${found} new post containers`);
+      console.log(`[FB Scraper] Scan found ${found} new post containers | emptyScanStreak: ${_consecutiveEmptyScans}`);
+    }
+    // Only reset consecutive empty scan counter when genuinely new posts
+    // were captured since the last scan. processPost runs asynchronously
+    // (via setTimeout for clickSeeMore), so we compare against the count
+    // at the START of this scan, reflecting captures from the previous scan.
+    // This prevents scroll-back from re-engaging when the scraper keeps
+    // finding re-rendered old posts in new DOM nodes (Facebook virtualization).
+    const currentCaptures = processedHashes.size;
+    if (currentCaptures > _lastCapturedCount) {
+      _consecutiveEmptyScans = 0;
+      _lastCapturedCount = currentCaptures;
+    } else {
+      _consecutiveEmptyScans++;
+    }
+    if (found === 0 && stallCount >= MAX_STALL - 2) {
+      // Log skip reasons when approaching stall to diagnose why nothing is found
+      console.log(`[FB Scraper] Scan found 0 new containers (stall: ${stallCount}/${MAX_STALL}) | emptyScanStreak: ${_consecutiveEmptyScans} | dirAuto: ${allDirAuto.length} | skips: short=${skipReasons.short} ui=${skipReasons.ui} noContainer=${skipReasons.noContainer} seen=${skipReasons.seen} done=${skipReasons.done} checked=${skipReasons.checked} nested=${skipReasons.nested}`);
     }
 
     // Second pass: look for dir="auto" elements with substantial text that
@@ -697,11 +733,22 @@
   }
 
   function processPost(container) {
+    if (!isActive) return;
     // Click "See more" to expand, then extract after delay
     const clicked = clickSeeMore(container);
-    const delay = clicked ? 800 : 0;
+    const delay = clicked ? 400 : 0;
 
     setTimeout(() => {
+      // Guard: if scraping was stopped during the delay, abort
+      if (!isActive) return;
+
+      // Guard: if the container was detached from the DOM (e.g. after sleep),
+      // skip extraction — the post will be re-discovered on the next scan
+      if (!document.contains(container)) {
+        console.log('[FB Scraper] Skipped detached container (DOM node removed, likely after sleep)');
+        return;
+      }
+
       // Click again in case expansion revealed more
       if (clicked) clickSeeMore(container);
 
@@ -766,28 +813,58 @@
 
       // Reject non-post content (notifications, footer, comment counts)
       const trimmedText = postText.trim();
-      if (/^Unread/i.test(trimmedText)) return;
-      if (/^\d+\s*comments?$/i.test(trimmedText)) return;
-      if (/^(· Privacy|Privacy\s+·\s+Terms)/i.test(trimmedText)) return;
-      if (/^\d+% recommend\b/i.test(trimmedText)) return;
-      if (/^Details\b/i.test(trimmedText) && /\b(recommend|contact info|privacy|terms)\b/i.test(trimmedText)) return;
-      if (/\b(added to (?:his|her|their) story)\b/i.test(trimmedText) && trimmedText.length < 100) return;
-      if (/\b(sent messages? to)\b/i.test(trimmedText) && trimmedText.length < 100) return;
+      if (/^Unread/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
+      if (/^\d+\s*comments?$/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
+      if (/^(· Privacy|Privacy\s+·\s+Terms)/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
+      if (/^\d+% recommend\b/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
+      if (/^Details\b/i.test(trimmedText) && /\b(recommend|contact info|privacy|terms)\b/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
+      if (/\b(added to (?:his|her|their) story)\b/i.test(trimmedText) && trimmedText.length < 100) { container.dataset.fbScraperChecked = 'true'; return; }
+      if (/\b(sent messages? to)\b/i.test(trimmedText) && trimmedText.length < 100) { container.dataset.fbScraperChecked = 'true'; return; }
 
       // Deduplicate by permalink — allow longer text to replace shorter
+      let isReplacement = false;
+      let replaceMatchPrefix = '';
       if (permalink && processedPermalinks.has(permalink)) {
         const prevLen = processedPermalinks.get(permalink);
-        if (postText.length <= prevLen) return;
-        console.log('[FB Scraper] Replacing truncated capture for', permalink,
+        if (postText.length <= prevLen) {
+          console.log('[FB Scraper] Skipped permalink dup:', permalink, '| text:', postText.substring(0, 40) + '...', '| len:', postText.length, '<=', prevLen);
+          container.dataset.fbScraperDone = 'true';
+          return;
+        }
+        console.log('[FB Scraper] Replacing truncated capture (permalink) for', permalink,
           '(', prevLen, '->', postText.length, 'chars)');
+        isReplacement = true;
       }
 
-      const isReplacement = permalink && processedPermalinks.has(permalink);
+      // Deduplicate by text prefix — catches truncated "See more" captures
+      // (e.g. "【Title】m.me" vs full expanded text starting with "【Title】...")
+      const PREFIX_LEN = 40;
+      const prefixKey = hashString(author + postText.substring(0, PREFIX_LEN));
+      const existingPrefix = processedPrefixes.get(prefixKey);
+      if (existingPrefix && !isReplacement) {
+        if (postText.length <= existingPrefix.textLength) {
+          console.log('[FB Scraper] Skipped prefix dup:', author, '|', postText.substring(0, 40) + '...', '| len:', postText.length, '<=', existingPrefix.textLength);
+          container.dataset.fbScraperDone = 'true';
+          return;
+        }
+        // New text is longer — replace the truncated capture
+        console.log('[FB Scraper] Replacing truncated capture (prefix) for', author,
+          '|', postText.substring(0, 40) + '...', '(', existingPrefix.textLength, '->', postText.length, 'chars)');
+        // Remove the old hash so the new one passes the hash check
+        processedHashes.delete(existingPrefix.hash);
+        isReplacement = true;
+        replaceMatchPrefix = postText.substring(0, PREFIX_LEN);
+      }
 
       const key = hashString(author + postText);
-      if (processedHashes.has(key)) return;
+      if (processedHashes.has(key)) {
+        console.log('[FB Scraper] Skipped hash dup:', author, '|', postText.substring(0, 40) + '...', '| permalink:', permalink || 'none');
+        container.dataset.fbScraperDone = 'true';
+        return;
+      }
       processedHashes.add(key);
       if (permalink) processedPermalinks.set(permalink, postText.length);
+      processedPrefixes.set(prefixKey, { textLength: postText.length, hash: key });
 
       const reactions = extractReactions(container);
       const comments = extractComments(container);
@@ -806,16 +883,27 @@
         scrapedAt: new Date().toISOString(),
       };
 
-      chrome.runtime.sendMessage({ type: isReplacement ? 'REPLACE_POST' : 'NEW_POST', post });
+      const msg = { type: isReplacement ? 'REPLACE_POST' : 'NEW_POST', post };
+      if (isReplacement && replaceMatchPrefix) {
+        msg.matchPrefix = replaceMatchPrefix;
+        msg.matchAuthor = author;
+      }
+      chrome.runtime.sendMessage(msg);
       console.log('[FB Scraper] Captured:', author, '|', postText.substring(0, 40) + '...');
 
       // If text is short, try expanding asynchronously and replacing
-      if (postText.length < 200 && permalink && !isReplacement) {
+      if (postText.length < 200 && !isReplacement) {
+        const retryPrefixKey = prefixKey;
         setTimeout(() => {
+          if (!document.contains(container)) {
+            console.log('[FB Scraper] Retry: container detached, skipping re-expand');
+            return;
+          }
           const retryClicked = clickSeeMore(container);
           if (retryClicked) {
-            console.log('[FB Scraper] Retry: clicked See more for', permalink);
+            console.log('[FB Scraper] Retry: clicked See more for', author, '|', postText.substring(0, 30));
             setTimeout(() => {
+              if (!document.contains(container)) return;
               let retryText = extractPostText(container);
               if (retryText.length > MAX_POST_LENGTH) {
                 console.warn('[FB Scraper] Retry text extremely long (' + retryText.length + ' chars), trimming to ' + MAX_POST_LENGTH);
@@ -824,13 +912,23 @@
               if (retryText.length > postText.length) {
                 console.log('[FB Scraper] Retry: expanded', postText.length, '->', retryText.length, 'chars');
                 const retryPost = { ...post, postText: retryText, scrapedAt: new Date().toISOString() };
-                processedPermalinks.set(permalink, retryText.length);
-                processedHashes.add(hashString(author + retryText));
-                chrome.runtime.sendMessage({ type: 'REPLACE_POST', post: retryPost });
+                if (permalink) processedPermalinks.set(permalink, retryText.length);
+                const retryHash = hashString(author + retryText);
+                processedHashes.add(retryHash);
+                processedPrefixes.set(retryPrefixKey, { textLength: retryText.length, hash: retryHash });
+                const retryMsg = { type: 'REPLACE_POST', post: retryPost };
+                if (permalink) {
+                  // Match by permalink
+                } else {
+                  // Match by prefix
+                  retryMsg.matchPrefix = postText.substring(0, PREFIX_LEN);
+                  retryMsg.matchAuthor = author;
+                }
+                chrome.runtime.sendMessage(retryMsg);
               }
-            }, 1000);
+            }, 500);
           }
-        }, 2000);
+        }, 1000);
       }
     }, delay);
   }
@@ -840,51 +938,95 @@
     return new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'GET_POSTS' }, (res) => {
         if (res && res.posts) {
+          const PREFIX_LEN = 40;
           for (const post of res.posts) {
-            const key = hashString((post.author || '') + (post.postText || ''));
+            const author = post.author || '';
+            const text = post.postText || '';
+            const key = hashString(author + text);
             processedHashes.add(key);
             if (post.permalink) {
-              const len = (post.postText || '').length;
+              const len = text.length;
               const prev = processedPermalinks.get(post.permalink) || 0;
               if (len > prev) processedPermalinks.set(post.permalink, len);
             }
+            // Restore prefix dedup state
+            const prefixKey = hashString(author + text.substring(0, PREFIX_LEN));
+            const existing = processedPrefixes.get(prefixKey);
+            if (!existing || text.length > existing.textLength) {
+              processedPrefixes.set(prefixKey, { textLength: text.length, hash: key });
+            }
           }
-          console.log('[FB Scraper] Restored', processedHashes.size, 'hashes,', processedPermalinks.size, 'permalinks from storage');
+          console.log('[FB Scraper] Restored', processedHashes.size, 'hashes,', processedPermalinks.size, 'permalinks,', processedPrefixes.size, 'prefixes from storage');
         }
         resolve();
       });
     });
   }
 
+  // Scroll-back state (declared here so wake detection in startAutoScroll can reset it)
+  let _prevScrollY = window.scrollY;
+  let _scrollBackTarget = -1;
+  let _consecutiveEmptyScans = 0; // tracks how many scans found 0 new captures
+  let _lastCapturedCount = 0; // tracks processedHashes.size for empty scan detection
+  const SCROLL_BACK_SUPPRESS_THRESHOLD = 4; // disable scroll-back after this many empty scans
+
   // Detect large scroll jumps from Facebook's virtualization.
   // When a forward jump > 800px is detected, immediately scan to catch
   // posts that may be briefly visible, then scroll back so the normal
   // scroll can re-traverse the skipped area.
-  let _prevScrollY = window.scrollY;
-  let _scrollBackTarget = -1;
   window.addEventListener('scroll', () => {
     if (!isActive) { _prevScrollY = window.scrollY; return; }
     const curY = window.scrollY;
     const delta = curY - _prevScrollY;
     if (delta > 800) {
-      // Large forward jump — scan immediately and schedule a scroll-back
-      console.log('[FB Scraper] Scroll jump +' + delta + ', scanning & scrolling back');
+      // Large forward jump — scan immediately
       scanForPosts();
-      _scrollBackTarget = _prevScrollY;
-      // Use requestAnimationFrame to scroll back after the browser settles
-      requestAnimationFrame(() => {
-        if (_scrollBackTarget >= 0) {
-          window.scrollTo({ top: _scrollBackTarget, behavior: 'instant' });
-          _scrollBackTarget = -1;
-        }
-      });
+
+      // Only scroll back if recent scans are finding new posts.
+      // If we've had several empty scans, the current area is fully scraped
+      // and scroll-back would trap us in a loop.
+      if (_consecutiveEmptyScans < SCROLL_BACK_SUPPRESS_THRESHOLD) {
+        console.log('[FB Scraper] Scroll jump +' + delta + ', scanning & scrolling back');
+        _scrollBackTarget = _prevScrollY;
+        requestAnimationFrame(() => {
+          if (_scrollBackTarget >= 0) {
+            window.scrollTo({ top: _scrollBackTarget, behavior: 'instant' });
+            _scrollBackTarget = -1;
+          }
+        });
+      } else {
+        console.log('[FB Scraper] Scroll jump +' + delta + ', scanning (scroll-back suppressed, advancing to new area)');
+      }
     }
     _prevScrollY = curY;
   }, { passive: true });
 
   function startAutoScroll() {
     if (autoScrollInterval) return;
+    let expectedTickCount = 0;
+    const scrollStartTime = Date.now();
     autoScrollInterval = setInterval(() => {
+      expectedTickCount++;
+      const now = Date.now();
+      const wallElapsed = now - scrollStartTime;
+      const expectedElapsed = expectedTickCount * SCROLL_INTERVAL;
+
+      // Wake detection: if wall clock is far ahead of expected ticks,
+      // the system slept and Chrome is firing accumulated ticks in a burst
+      if (wallElapsed > expectedElapsed + SCROLL_INTERVAL * 4) {
+        // Fast-forward the tick counter to match wall clock, absorbing the burst
+        expectedTickCount = Math.ceil(wallElapsed / SCROLL_INTERVAL);
+        console.log('[FB Scraper] Wake detected (wall drift: ' + Math.round((wallElapsed - expectedElapsed) / 1000) + 's), resetting counters | posts so far:', processedHashes.size, '| scrollY:', Math.round(window.scrollY));
+        stallCount = 0;
+        autoRetryCount = 0;
+        _consecutiveEmptyScans = 0;
+        _lastCapturedCount = processedHashes.size;
+        lastPostCount = processedHashes.size;
+        lastDocHeight = document.documentElement.scrollHeight;
+        _prevScrollY = window.scrollY; // prevent false scroll-jump detection
+        return; // skip this tick, let Facebook stabilize
+      }
+
       const currentCount = processedHashes.size;
       const currentDocHeight = document.documentElement.scrollHeight;
 
@@ -900,13 +1042,20 @@
         lastDocHeight = currentDocHeight;
       } else {
         stallCount++;
+        if (stallCount === MAX_STALL - 2) {
+          console.log(`[FB Scraper] Approaching stall (${stallCount}/${MAX_STALL}) | posts: ${currentCount} | scrollY: ${Math.round(window.scrollY)} | docHeight: ${currentDocHeight} | atBottom: ${window.innerHeight + window.scrollY >= currentDocHeight - 100}`);
+        }
         if (stallCount >= MAX_STALL) {
           clearInterval(autoScrollInterval);
           autoScrollInterval = null;
 
           if (autoRetryCount < MAX_AUTO_RETRY) {
             autoRetryCount++;
-            console.log(`[FB Scraper] Stalled — auto-retry ${autoRetryCount}/${MAX_AUTO_RETRY} in ${AUTO_RETRY_DELAY / 1000}s...`);
+            // Diagnostic: log state at stall to understand why scanner found nothing
+            const markedDone = document.querySelectorAll('[data-fb-scraper-done]').length;
+            const markedChecked = document.querySelectorAll('[data-fb-scraper-checked]').length;
+            const allDirAutoCount = document.querySelectorAll('div[dir="auto"], span[dir="auto"]').length;
+            console.log(`[FB Scraper] Stalled — auto-retry ${autoRetryCount}/${MAX_AUTO_RETRY} in ${AUTO_RETRY_DELAY / 1000}s... | posts: ${processedHashes.size} | scrollY: ${Math.round(window.scrollY)} | docHeight: ${currentDocHeight} | dirAuto: ${allDirAutoCount} | markedDone: ${markedDone} | markedChecked: ${markedChecked}`);
             setTimeout(() => {
               if (!isActive) return; // Don't retry if user paused/stopped
               stallCount = 0;
@@ -914,7 +1063,7 @@
               startAutoScroll();
             }, AUTO_RETRY_DELAY);
           } else {
-            console.log('[FB Scraper] No new posts after ' + MAX_AUTO_RETRY + ' retries, stopping auto-scroll');
+            console.log('[FB Scraper] No new posts after ' + MAX_AUTO_RETRY + ' retries, stopping auto-scroll | scrollY: ' + Math.round(window.scrollY) + ' | docHeight: ' + document.documentElement.scrollHeight);
             chrome.runtime.sendMessage({ type: 'AUTO_SCROLL_DONE' });
           }
           return;
@@ -933,6 +1082,7 @@
 
     // Restore state from storage to avoid re-scraping posts
     await restoreStateFromStorage();
+    _lastCapturedCount = processedHashes.size;
 
     // Resume downloads in background
     chrome.runtime.sendMessage({ type: 'RESUME_DOWNLOADS' });
@@ -941,16 +1091,38 @@
     scanForPosts();
 
     // MutationObserver for dynamically added content
+    let mutationLastTime = Date.now();
     observer = new MutationObserver(() => {
+      const now = Date.now();
+      const gap = now - mutationLastTime;
+      mutationLastTime = now;
+
+      // Skip burst of mutations after wake — DOM is stale
+      if (gap > 10000) {
+        console.log('[FB Scraper] MutationObserver wake detected (gap: ' + Math.round(gap / 1000) + 's), skipping stale mutations');
+        return;
+      }
+
       // Debounce: don't scan on every tiny mutation
       clearTimeout(observer._debounce);
-      observer._debounce = setTimeout(scanForPosts, 500);
+      observer._debounce = setTimeout(scanForPosts, 300);
     });
 
     observer.observe(document.body, { childList: true, subtree: true });
 
-    // Periodic fallback scanner
-    scrollInterval = setInterval(scanForPosts, SCAN_INTERVAL);
+    // Periodic fallback scanner (with wake detection)
+    let scanLastTickTime = Date.now();
+    scrollInterval = setInterval(() => {
+      const now = Date.now();
+      const elapsed = now - scanLastTickTime;
+      scanLastTickTime = now;
+
+      if (elapsed > SCAN_INTERVAL * 5) {
+        console.log('[FB Scraper] Scanner wake detected (gap: ' + Math.round(elapsed / 1000) + 's), skipping stale tick');
+        return; // skip this tick — DOM is likely stale
+      }
+      scanForPosts();
+    }, SCAN_INTERVAL);
 
     // Auto-scroll: smoothly scroll down to trigger Facebook's infinite scroll
     stallCount = 0;
@@ -977,9 +1149,10 @@
       autoScrollInterval = null;
     }
     stallCount = 0;
+    autoRetryCount = 0;
     // Pause downloads when scraping is paused
     chrome.runtime.sendMessage({ type: 'PAUSE_DOWNLOADS' });
-    console.log('[FB Scraper] Paused');
+    console.log('[FB Scraper] Stopped (isActive:', isActive, ')');
   }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

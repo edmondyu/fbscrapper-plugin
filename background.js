@@ -164,14 +164,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Replace a previously captured truncated post with an expanded version
     chrome.storage.local.get({ posts: [] }, (result) => {
       const posts = result.posts;
-      const idx = posts.findIndex(p => p.permalink && p.permalink === msg.post.permalink);
+      // Strategy 1: match by permalink
+      let idx = -1;
+      if (msg.post.permalink) {
+        idx = posts.findIndex(p => p.permalink && p.permalink === msg.post.permalink);
+      }
+      // Strategy 2: match by author + text prefix (for posts without unique permalink)
+      if (idx === -1 && msg.matchPrefix && msg.matchAuthor) {
+        idx = posts.findIndex(p =>
+          p.author === msg.matchAuthor &&
+          p.postText && p.postText.substring(0, msg.matchPrefix.length) === msg.matchPrefix
+        );
+      }
       if (idx !== -1) {
         posts[idx] = msg.post;
         chrome.storage.local.set({ posts }, () => {
           sendResponse({ ok: true, replaced: true, count: posts.length });
         });
       } else {
-        // Permalink not found — treat as new post
+        // Match not found — treat as new post
         posts.push(msg.post);
         chrome.storage.local.set({ posts }, () => {
           sendResponse({ ok: true, replaced: false, count: posts.length });

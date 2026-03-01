@@ -7,7 +7,8 @@ A Chrome extension (Manifest V3) that scrapes Facebook posts as you scroll throu
 - **Auto-scroll & scrape** — automatically scrolls down and captures posts in real-time
 - **Pause / Resume / Stop** — full control over scraping sessions; resume picks up where you left off
 - **Auto-retry on stall** — if scrolling stalls (e.g. Facebook throttles loading), automatically retries up to 5 times before stopping
-- **Scroll-back recovery** — detects and recovers from Facebook's virtualized feed scroll jumps to avoid skipping posts
+- **Scroll-back recovery** — detects and recovers from Facebook's virtualized feed scroll jumps to avoid skipping posts; automatically suppresses scroll-back when advancing past fully-scraped areas
+- **Sleep/wake resilience** — detects MacBook sleep via wall-clock drift and gracefully recovers (resets stall counters, skips stale DOM mutations, guards against detached nodes)
 - **Image auto-download** — downloads post images to a `fb-scraper/` folder while CDN session tokens are still active
 - **Download queue** — sequential downloads with progress tracking, retry for failed downloads
 - **Two export modes**:
@@ -20,8 +21,8 @@ A Chrome extension (Manifest V3) that scrapes Facebook posts as you scroll throu
   - Block-level deduplication (detects when Facebook renders the same text twice)
   - Junk timestamp cleanup
 - **Text quality**:
-  - Auto-expands "See more" links before scraping
-  - Line-level and block-level deduplication
+  - Auto-expands "See more" links before scraping, with async retry for short captures
+  - Three-layer deduplication: permalink, text prefix, and content hash
   - Strips Facebook UI noise (navigation, button labels, notification panels)
   - Handles scrambled "Sponsored" text obfuscation (including `\u00a0` non-breaking spaces)
 - **Timestamp extraction** — 5-strategy approach to find timestamps from various Facebook DOM patterns, including Chinese date formats
@@ -95,13 +96,14 @@ The **sanitized** export additionally strips session-specific CDN parameters (`_
 - Runs on all `facebook.com` pages
 - Auto-detects logged-in user's name on page load (retries up to 10 times)
 - Uses `MutationObserver` + periodic scanning to detect new posts
-- Auto-scrolls with stall detection and auto-retry (5 retries, 5s delay each)
+- Auto-scrolls with stall detection and auto-retry (5 retries, 3s delay each)
 - Extracts post data from Facebook's DOM (`dir="auto"` elements, permalink patterns, aria-labels)
 - Communicates with background via `chrome.runtime.sendMessage`
 
 ### Background Service Worker (`background.js`)
 - Stores posts and download queue in `chrome.storage.local`
 - Manages sequential image download queue with pause/resume
+- Supports post replacement by permalink or author+prefix matching (for truncated text upgrades)
 - Persists state across service worker restarts
 
 ### Popup (`popup.js`)
@@ -134,14 +136,30 @@ Posts with longer text (more expansion) tend to cause larger jumps.
 2. **Scroll back**: `window.scrollTo()` restores the pre-jump position
 3. **Normal scroll resumes**: The 400px auto-scroll re-traverses the area
 
-This results in a one-post-per-jump-back-cycle rhythm after the first few posts — slower but 100% reliable.
+This results in a one-post-per-jump-back-cycle rhythm after the first few posts — slower but reliable. When an area is fully scraped, scroll-back is automatically suppressed (see below).
 
 ### The Stall-Retry Mechanism
-The stall detection (8 intervals × 2.5s = 20s with no new posts) and auto-retry (5s pause, up to 5 retries) works in tandem with the scroll-back fix:
+The stall detection (6 intervals × 1.5s = 9s with no new posts) and auto-retry (3s pause, up to 5 retries) works in tandem with the scroll-back fix:
 1. After the scroll jump + scroll-back cycle, the scraper may not immediately find new posts
 2. Stall detection pauses auto-scroll
-3. During the 5s retry delay, Facebook's DOM stabilizes
+3. During the 3s retry delay, Facebook's DOM stabilizes
 4. When scrolling resumes, posts are cleanly available for scanning
+
+### Scroll-back Suppression
+When the scraper has fully scraped an area, scroll-back can trap it in a loop (all containers marked done, but scroll jumps keep pulling it back). The scraper tracks consecutive scans with no new captures. After 4 such scans, scroll-back is suppressed, allowing the scraper to advance to new territory. The counter resets only when genuinely new posts are captured (not just when unmarked containers are found).
+
+### Sleep/Wake Detection
+When a MacBook enters sleep mode, Chrome accumulates `setInterval` ticks and fires them in a burst on wake. The scraper detects this via wall-clock drift: if the actual elapsed time since the interval started is far ahead of the expected tick count (> 4× interval), it infers a sleep event. On detection:
+- Stall and retry counters are reset to prevent false "no new posts" stops
+- Scroll position tracking is reset to prevent false jump detection
+- The periodic scanner and MutationObserver skip stale ticks/mutations
+- Detached DOM node guards prevent processing containers that were removed during sleep
+
+### Permalink Cleaning & Deduplication
+Facebook's `/photo/` URLs without identifying query parameters (e.g. `fbid`) are not unique permalinks — they are shared across all photo posts on a Page. The scraper rejects these generic paths and preserves identifying params (`fbid`, `story_fbid`, `v`) when cleaning URLs. Posts without unique permalinks are deduplicated via a three-layer approach:
+1. **Permalink dedup**: Unique permalink → replace shorter text with longer
+2. **Prefix dedup**: `hash(author + first 40 chars)` → catches truncated "See more" captures
+3. **Hash dedup**: `hash(author + fullText)` → exact content match
 
 ### The "Facebook" Nav Element Problem
 Facebook renders a `<div dir="auto">` element containing just the text "Facebook" as part of its navigation. This element shares a DOM container with actual posts. Since the scraper finds post containers by walking up from `dir="auto"` text elements, the "Facebook" text was claiming the container first, blocking the real post from being processed. Fixed by adding "facebook" to the UI text filter.
