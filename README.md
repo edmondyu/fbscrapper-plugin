@@ -167,15 +167,49 @@ Facebook renders a `<div dir="auto">` element containing just the text "Facebook
 ### Shared Container Problem
 On Facebook Pages, adjacent posts by the same author can share a common DOM ancestor. The scraper's `findPostContainer()` walks up from text elements to find post boundaries, but sometimes two posts resolve to the same container. When the first post marks the container as "done", the second post's text elements become orphaned (no valid container).
 
-**Current solution**: A two-pass scan approach:
+**Current solution**: A three-pass scan approach:
 1. **Main pass**: Standard `findPostContainer()` pipeline — works for most posts
 2. **Orphan pass**: After the main scan, looks for `dir="auto"` elements with 100+ characters of uncaptured text where `findPostContainer()` returned null. Walks up to find the nearest ancestor with an uncaptured permalink and processes it through `processPost()`.
+3. **Photo-only pass**: Detects posts with no text content (see "Photo-Only Post Detection" below).
 
 ### Long Text Safeguard
 Posts exceeding 10,000 characters are automatically trimmed to prevent browser performance issues (the block-level deduplication algorithm is O(N² × M) on text length). Trimmed posts are prefixed with `[attention: post text too long, content is trimmed]` and a console warning is logged.
 
 ### Post-Extraction Garbage Filtering
 Facebook pages contain many non-post elements (notifications, footer text, comment counts, page info) that can slip through container detection. The scraper filters these at the extraction stage by rejecting text matching patterns like notification items (`Unread...`), comment counts (`N comments`), footer text (`Privacy · Terms`), and page details (`Details ... recommend`).
+
+### Photo-Only Post Detection (v1.2.0)
+
+Photo-only posts (posts with just an image and no text) were invisible to the main scanner because:
+
+1. **No qualifying `dir="auto"` text**: The main scan iterates `dir="auto"` elements looking for text >= 8 characters. In photo-only posts, the only `dir="auto"` elements contain the word "Facebook" (anti-scraping padding), which is filtered by the UI text filter at the scan entry point.
+2. **Author name uses `dir="ltr"`**: The author heading (e.g. `<h2>林妙茵Miu</h2>`) uses `dir="ltr"`, not `dir="auto"`, so it never enters the scanner's element loop.
+3. **No text for container discovery**: Since the main scan finds post containers by walking UP from text elements, and there are no qualifying text elements, the container is never discovered.
+
+#### Facebook's Anti-Scraping DOM Padding
+
+Photo-only posts have a distinctive DOM structure:
+- The post container has **20+ direct children**
+- ~20 of these are `<div aria-hidden="true">` blocks, each containing a `<blockquote>` with `<span dir="auto">Facebook</span>` — **anti-scraping padding** designed to confuse text-based scrapers
+- Each padding block also has `data-0` through `data-19` attributes and a hidden `role="button"` element
+- The **"Sponsored" label is obfuscated**: individual `<span>` elements each contain a single character (e.g. `>S</span>`, `>p</span>`, `>o</span>`...) with CSS class-based reordering to visually spell "Sponsored" while being unreadable to scrapers
+- The **profile picture** is rendered as an SVG `<image xlink:href="scontent...">`, NOT an HTML `<img>` tag — so `img[src*="scontent"]` selectors do not match
+
+#### The Solution: Third-Pass "Facebook" Element Walk-Up
+
+The third pass uses the very "Facebook" text that the main scan filters out as an **entry point**:
+
+1. **Find "Facebook" elements**: Iterate all `dir="auto"` elements, looking for those with text exactly "Facebook"
+2. **Walk up to post boundary**: From each "Facebook" element, walk up the DOM (max 10 levels) to find the first ancestor with `children.length >= 10` — this reaches the post container with its 20+ anti-scraping padding children
+3. **Validate as a real post**: The container must have:
+   - An author heading (`h2`, `h3`, or `h4`)
+   - A post permalink (`/posts/`, `/photo/`, or `/videos/` link)
+4. **Overlap guard**: Check that no element already in `seenContainers` (from the main scan) is a descendant of this container. This prevents re-processing regular text posts (whose inner containers were already captured by the main scan). This check must use `seenContainers` (populated synchronously) rather than DOM markers (`data-fb-scraper-done`), because `processPost` sets markers asynchronously inside `setTimeout`.
+5. **Process**: Pass the container to `processPost()`, which extracts the author name from the `<h2>` heading and the permalink from the link — post text is empty (all "Facebook" padding filtered by `extractPostText`).
+
+#### The Duplicate Text / Short URL Problem
+
+When the third pass finds a container that is a LARGER ancestor of an already-captured post (rather than the photo-only post), the larger container includes extra DOM content like link preview URLs (e.g. `NR42jdCK.com`, `c9kozB5P.com`, `1G59eKq.com`). This produces duplicated post text with junk short URLs inserted. The overlap guard (step 4 above) prevents this by skipping containers that already have captured posts inside them. Additionally, "facebook" was added to the `extractPostText` filter to ensure the anti-scraping "Facebook" padding text is excluded from extracted post content.
 
 ### Key Architectural Insights
 1. **Work WITH Facebook's virtualization, not against it**: Use `scrollBy` (relative) rather than `scrollTo` (absolute). Let Facebook manage its DOM window, but recover when it jumps.
@@ -191,7 +225,7 @@ Facebook pages contain many non-post elements (notifications, footer text, comme
 - Facebook DOM structure may change, which could break selectors
 - Timestamp extraction depends on Facebook's DOM patterns; some posts may have missing timestamps depending on the page layout
 - Auto-scroll may stall on very long timelines; the extension auto-retries but may eventually stop
-- **Photo-only posts** (no text content) may be skipped since the scraper relies on `dir="auto"` text elements for post detection
+- **Post ordering**: Posts may occasionally appear out of order in the CSV due to timing differences between the main scan and the third-pass photo-only detection
 - **Posts deep in the feed** may be missed if Facebook's virtualized feed removes them from the DOM before the scanner processes them
 
 ## License

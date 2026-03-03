@@ -227,7 +227,7 @@
 
       // Skip UI elements: buttons, short labels
       const lower = text.toLowerCase();
-      if (/^(like|comment|share|send|reply|see more|hide|follow|suggested for you|sponsored|·|…)$/i.test(lower)) continue;
+      if (/^(like|comment|share|send|reply|see more|hide|follow|suggested for you|sponsored|facebook|·|…)$/i.test(lower)) continue;
       if (/^(boost|insights|promote|advertise)/i.test(lower)) continue;
       if (/^(switch into|you're commenting|manage|write a comment)/i.test(lower)) continue;
       if (/^boost this post/i.test(lower)) continue;
@@ -729,6 +729,77 @@
       seenContainers.add(postParent);
       console.log('[FB Scraper] Processing orphan post:', text.substring(0, 50));
       processPost(postParent);
+    }
+
+    // Third pass: detect photo-only posts that have no substantial text.
+    // These posts are invisible to the main scan because all their dir="auto"
+    // elements contain only "Facebook" anti-scraping padding (< 8 chars or
+    // filtered), and the author name uses dir="ltr" not dir="auto".
+    //
+    // DOM fingerprint (see DOM-NOTES.md):
+    //   - Post container has 20+ direct children
+    //   - ~20 aria-hidden divs with <blockquote><span dir="auto">Facebook</span>
+    //   - <h2> heading with author name (dir="ltr")
+    //   - Permalink: a[href*="/posts/"] or a[href*="/photo/"]
+    //   - Profile pic is SVG <image>, NOT <img> — don't use img selector
+    //
+    // Strategy: find "Facebook" dir="auto" elements, walk up to the first
+    // large ancestor (children >= 10), verify it has a heading AND permalink.
+    for (const el of allDirAuto) {
+      const text = el.innerText.trim();
+      if (text.toLowerCase() !== 'facebook') continue;
+
+      // Walk up to find the first large container (children >= 10)
+      let container = null;
+      let walker = el;
+      for (let i = 0; i < 10; i++) {
+        walker = walker.parentElement;
+        if (!walker || walker === document.body) break;
+        if (walker.children.length >= 10) {
+          container = walker;
+          break;
+        }
+      }
+      if (!container) continue;
+      if (seenContainers.has(container)) continue;
+      if (container.dataset.fbScraperDone) continue;
+      if (container.dataset.fbScraperChecked) continue;
+
+      // Skip if the main scan already captured a post INSIDE this container.
+      // The "Facebook" padding exists in ALL posts, not just photo-only ones.
+      // For regular text posts, the main scan uses a smaller inner container
+      // (via findPostContainer's lastCandidate). We can't rely on DOM markers
+      // here because processPost sets them asynchronously (inside setTimeout).
+      // Instead, check if any container already in seenContainers (populated
+      // synchronously by the main scan) is a descendant of this container.
+      let alreadyCaptured = false;
+      for (const seen of seenContainers) {
+        if (container.contains(seen)) { alreadyCaptured = true; break; }
+      }
+      if (alreadyCaptured) continue;
+
+      // Must have an author heading (h2/h3/h4) AND a post permalink
+      if (!container.querySelector('h2, h3, h4')) continue;
+      if (!container.querySelector('a[href*="/posts/"], a[href*="/photo/"], a[href*="/videos/"]')) continue;
+
+      // Must not be a sidebar/nav container
+      if (isNonPostContainer(container)) continue;
+
+      // Check nesting — same logic as main scan
+      let ancestor = container.parentElement;
+      let isNested = false;
+      while (ancestor && ancestor !== document.body) {
+        if (ancestor.dataset.fbScraperDone && ancestor.children.length < 8) {
+          isNested = true;
+          break;
+        }
+        ancestor = ancestor.parentElement;
+      }
+      if (isNested) continue;
+
+      seenContainers.add(container);
+      console.log('[FB Scraper] Third pass: processing photo-only post candidate');
+      processPost(container);
     }
   }
 
