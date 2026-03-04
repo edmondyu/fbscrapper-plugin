@@ -16,7 +16,7 @@ async function drainPostQueue() {
       const postIndex = posts.length;
       posts.push(post);
       await chrome.storage.local.set({ posts });
-      enqueueImages(postIndex, post.images);
+      await enqueueImages(postIndex, post.images);
       resolve({ ok: true, count: posts.length });
     }
   } finally {
