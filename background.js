@@ -1,7 +1,65 @@
 let isProcessing = false;
 let isPaused = false;
 
-// Serialize post storage writes to prevent race conditions
+// ── In-memory cache ──────────────────────────────────────────────────
+// Posts and downloadQueue are kept in memory to avoid per-post
+// read-modify-write cycles on chrome.storage.local.  Storage is
+// flushed on a debounced timer (every 2 seconds after last change)
+// so that even 200+ posts don't degrade performance.
+let _posts = null;           // null = not yet loaded
+let _downloadQueue = null;   // null = not yet loaded
+let _postsFlushTimer = null;
+let _queueFlushTimer = null;
+const FLUSH_DELAY = 2000;    // ms after last change before writing to storage
+
+async function getPosts() {
+  if (_posts === null) {
+    const result = await chrome.storage.local.get({ posts: [] });
+    _posts = result.posts;
+  }
+  return _posts;
+}
+
+async function getDownloadQueue() {
+  if (_downloadQueue === null) {
+    const result = await chrome.storage.local.get({ downloadQueue: [] });
+    _downloadQueue = result.downloadQueue;
+  }
+  return _downloadQueue;
+}
+
+function schedulePostsFlush() {
+  if (_postsFlushTimer) clearTimeout(_postsFlushTimer);
+  _postsFlushTimer = setTimeout(() => {
+    _postsFlushTimer = null;
+    if (_posts !== null) {
+      chrome.storage.local.set({ posts: _posts });
+    }
+  }, FLUSH_DELAY);
+}
+
+function scheduleQueueFlush() {
+  if (_queueFlushTimer) clearTimeout(_queueFlushTimer);
+  _queueFlushTimer = setTimeout(() => {
+    _queueFlushTimer = null;
+    if (_downloadQueue !== null) {
+      chrome.storage.local.set({ downloadQueue: _downloadQueue });
+    }
+  }, FLUSH_DELAY);
+}
+
+async function flushAll() {
+  if (_postsFlushTimer) { clearTimeout(_postsFlushTimer); _postsFlushTimer = null; }
+  if (_queueFlushTimer) { clearTimeout(_queueFlushTimer); _queueFlushTimer = null; }
+  const writes = {};
+  if (_posts !== null) writes.posts = _posts;
+  if (_downloadQueue !== null) writes.downloadQueue = _downloadQueue;
+  if (Object.keys(writes).length > 0) {
+    await chrome.storage.local.set(writes);
+  }
+}
+
+// ── Post queue (serialize writes to in-memory array) ─────────────────
 const postQueue = [];
 let isStoringPost = false;
 
@@ -9,35 +67,34 @@ async function drainPostQueue() {
   if (isStoringPost) return;
   isStoringPost = true;
   try {
+    const posts = await getPosts();
     while (postQueue.length > 0) {
       const { post, resolve } = postQueue.shift();
-      const result = await chrome.storage.local.get({ posts: [] });
-      const posts = result.posts;
       const postIndex = posts.length;
       posts.push(post);
-      await chrome.storage.local.set({ posts });
       enqueueImages(postIndex, post.images);
       resolve({ ok: true, count: posts.length });
     }
+    schedulePostsFlush();
   } finally {
     isStoringPost = false;
   }
 }
 
-// Process the download queue one item at a time
+// ── Download queue processing ────────────────────────────────────────
 async function processQueue() {
   if (isProcessing || isPaused) return;
   isProcessing = true;
 
   try {
+    const queue = await getDownloadQueue();
     while (!isPaused) {
-      const { downloadQueue = [] } = await chrome.storage.local.get('downloadQueue');
-      const next = downloadQueue.find(item => item.status === 'pending');
+      const next = queue.find(item => item.status === 'pending');
       if (!next) break;
 
       // Mark as downloading
       next.status = 'downloading';
-      await chrome.storage.local.set({ downloadQueue });
+      scheduleQueueFlush();
 
       try {
         await downloadFile(next.url, next.filename);
@@ -50,14 +107,7 @@ async function processQueue() {
         next.error = err.message || String(err);
       }
 
-      // Persist after each download
-      const latest = await chrome.storage.local.get('downloadQueue');
-      const queue = latest.downloadQueue || [];
-      const idx = queue.findIndex(q => q.url === next.url && q.postIndex === next.postIndex);
-      if (idx !== -1) {
-        queue[idx] = next;
-        await chrome.storage.local.set({ downloadQueue: queue });
-      }
+      scheduleQueueFlush();
     }
   } finally {
     isProcessing = false;
@@ -101,13 +151,14 @@ function downloadFile(url, filename) {
 async function enqueueImages(postIndex, images) {
   if (!images || images.length === 0) return;
 
-  const { downloadQueue = [], downloadFolder = 'fb-scraper' } = await chrome.storage.local.get(['downloadQueue', 'downloadFolder']);
+  const queue = await getDownloadQueue();
+  const { downloadFolder = 'fb-scraper' } = await chrome.storage.local.get('downloadFolder');
   const folder = downloadFolder || 'fb-scraper';
 
   for (let i = 0; i < images.length; i++) {
     const url = images[i];
     // Skip if already queued
-    if (downloadQueue.some(q => q.url === url)) continue;
+    if (queue.some(q => q.url === url)) continue;
 
     // Determine file extension from URL
     let ext = 'jpg';
@@ -115,7 +166,7 @@ async function enqueueImages(postIndex, images) {
     else if (url.includes('.webp')) ext = 'webp';
     else if (url.includes('.gif')) ext = 'gif';
 
-    downloadQueue.push({
+    queue.push({
       postIndex,
       imageIndex: i,
       url,
@@ -124,28 +175,28 @@ async function enqueueImages(postIndex, images) {
     });
   }
 
-  await chrome.storage.local.set({ downloadQueue });
+  scheduleQueueFlush();
   processQueue();
 }
 
 // Record the local filename on the post's localFiles array
 async function recordLocalFile(postIndex, imageIndex, filename) {
-  const { posts = [] } = await chrome.storage.local.get('posts');
+  const posts = await getPosts();
   if (postIndex < posts.length) {
     if (!posts[postIndex].localFiles) {
       posts[postIndex].localFiles = [];
     }
     posts[postIndex].localFiles[imageIndex] = filename;
-    await chrome.storage.local.set({ posts });
+    schedulePostsFlush();
   }
 }
 
-function getDownloadProgress(downloadQueue) {
-  const total = downloadQueue.length;
-  const completed = downloadQueue.filter(q => q.status === 'done').length;
-  const failed = downloadQueue.filter(q => q.status === 'failed').length;
-  const downloading = downloadQueue.filter(q => q.status === 'downloading').length;
-  const pending = downloadQueue.filter(q => q.status === 'pending').length;
+function getDownloadProgress(queue) {
+  const total = queue.length;
+  const completed = queue.filter(q => q.status === 'done').length;
+  const failed = queue.filter(q => q.status === 'failed').length;
+  const downloading = queue.filter(q => q.status === 'downloading').length;
+  const pending = queue.filter(q => q.status === 'pending').length;
   return { total, completed, failed, downloading, pending };
 }
 
@@ -162,8 +213,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'REPLACE_POST') {
     // Replace a previously captured truncated post with an expanded version
-    chrome.storage.local.get({ posts: [] }, (result) => {
-      const posts = result.posts;
+    getPosts().then((posts) => {
       // Strategy 1: match by permalink
       let idx = -1;
       if (msg.post.permalink) {
@@ -178,58 +228,68 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (idx !== -1) {
         posts[idx] = msg.post;
-        chrome.storage.local.set({ posts }, () => {
-          sendResponse({ ok: true, replaced: true, count: posts.length });
-        });
+        schedulePostsFlush();
+        sendResponse({ ok: true, replaced: true, count: posts.length });
       } else {
         // Match not found — treat as new post
         posts.push(msg.post);
-        chrome.storage.local.set({ posts }, () => {
-          sendResponse({ ok: true, replaced: false, count: posts.length });
-        });
+        schedulePostsFlush();
+        sendResponse({ ok: true, replaced: false, count: posts.length });
       }
     });
     return true;
   }
 
   if (msg.type === 'GET_POSTS') {
-    chrome.storage.local.get({ posts: [] }, (result) => {
-      sendResponse({ posts: result.posts });
+    // Flush first so popup always sees up-to-date data
+    flushAll().then(() => {
+      getPosts().then((posts) => {
+        sendResponse({ posts });
+      });
     });
     return true;
   }
 
   if (msg.type === 'GET_COUNT') {
-    chrome.storage.local.get({ posts: [] }, (result) => {
-      sendResponse({ count: result.posts.length });
+    getPosts().then((posts) => {
+      sendResponse({ count: posts.length });
     });
     return true;
   }
 
   if (msg.type === 'CLEAR_POSTS') {
+    _posts = [];
+    _downloadQueue = [];
+    isPaused = false;
     chrome.storage.local.set({ posts: [], downloadQueue: [] }, () => {
-      isPaused = false;
       sendResponse({ ok: true });
     });
     return true;
   }
 
   if (msg.type === 'EXPORT_POSTS') {
-    chrome.storage.local.get({ posts: [] }, (result) => {
-      sendResponse({ posts: result.posts });
+    // Flush to storage before export to ensure consistency
+    flushAll().then(() => {
+      getPosts().then((posts) => {
+        sendResponse({ posts });
+      });
     });
     return true;
   }
 
   if (msg.type === 'AUTO_SCROLL_DONE') {
-    chrome.runtime.sendMessage({ type: 'SCROLL_FINISHED' }).catch(() => {});
-    sendResponse({ ok: true });
+    // Scraping stopped — flush in-memory data to storage immediately
+    // so nothing is lost if the service worker is terminated
+    flushAll().then(() => {
+      chrome.runtime.sendMessage({ type: 'SCROLL_FINISHED' }).catch(() => {});
+      sendResponse({ ok: true });
+    });
     return true;
   }
 
   if (msg.type === 'GET_DOWNLOAD_PROGRESS') {
-    chrome.storage.local.get({ downloadQueue: [] }, (result) => {
-      sendResponse(getDownloadProgress(result.downloadQueue));
+    getDownloadQueue().then((queue) => {
+      sendResponse(getDownloadProgress(queue));
     });
     return true;
   }
@@ -248,27 +308,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'RETRY_FAILED') {
-    chrome.storage.local.get({ downloadQueue: [] }, (result) => {
-      const queue = result.downloadQueue;
+    getDownloadQueue().then((queue) => {
       for (const item of queue) {
         if (item.status === 'failed') {
           item.status = 'pending';
           delete item.error;
         }
       }
-      chrome.storage.local.set({ downloadQueue: queue }, () => {
-        processQueue();
-        sendResponse({ ok: true });
-      });
+      scheduleQueueFlush();
+      processQueue();
+      sendResponse({ ok: true });
     });
     return true;
   }
 });
 
 // On service worker startup, resume any pending downloads
-chrome.storage.local.get({ downloadQueue: [] }, (result) => {
-  const queue = result.downloadQueue;
-  // Reset any items stuck in 'downloading' state (service worker was killed)
+getDownloadQueue().then((queue) => {
   let changed = false;
   for (const item of queue) {
     if (item.status === 'downloading') {
@@ -277,10 +333,9 @@ chrome.storage.local.get({ downloadQueue: [] }, (result) => {
     }
   }
   if (changed) {
-    chrome.storage.local.set({ downloadQueue: queue }, () => {
-      processQueue();
-    });
-  } else if (queue.some(q => q.status === 'pending')) {
+    scheduleQueueFlush();
+  }
+  if (queue.some(q => q.status === 'pending')) {
     processQueue();
   }
 });

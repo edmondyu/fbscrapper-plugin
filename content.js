@@ -115,6 +115,22 @@
   // direct child is one post.  We stop just below that boundary so each post
   // gets its own container.  For pages without virtualization we fall back to
   // the original "many children" heuristic.
+  // Cheap text-presence check: sample a few child text nodes to estimate
+  // whether a container has real text content.  Avoids textContent/innerText
+  // which concatenate ALL descendant text into one string — near the DOM root
+  // that creates multi-MB strings and causes OOM crashes when called thousands
+  // of times per scan.
+  function hasSubstantialText(el, minLength) {
+    let total = 0;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+    let node;
+    while ((node = walker.nextNode())) {
+      total += node.nodeValue.length;
+      if (total >= minLength) return true;
+    }
+    return false;
+  }
+
   function findPostContainer(el) {
     let p = el;
     let lastCandidate = null;
@@ -128,8 +144,10 @@
         return lastCandidate || p;
       }
 
-      // Original heuristic: container with many children
-      if (p.children.length >= 10 && p.innerText.length > 100) {
+      // Original heuristic: container with many children.
+      // Use hasSubstantialText() instead of textContent.length to avoid
+      // creating huge concatenated strings (OOM risk near DOM root).
+      if (p.children.length >= 10 && hasSubstantialText(p, 100)) {
         if (isNonPostContainer(p)) continue;
         if (p.querySelector('a[href]') === null) continue;
         // If we already found a good post-like candidate closer to the
@@ -142,7 +160,7 @@
       // A post container has 3+ children, a link, some text, and an author
       // indicator (heading OR strong tag — Facebook uses different elements
       // for different posts on the same page).
-      if (p.children.length >= 3 && p.querySelector('a[href]') && p.innerText.length > 20) {
+      if (p.children.length >= 3 && p.querySelector('a[href]') && hasSubstantialText(p, 20)) {
         const hasAuthor = p.querySelector('h2, h3, h4, h5, h6, strong');
         if (hasAuthor) {
           if (!lastCandidate || p.children.length > lastCandidate.children.length) {
@@ -262,10 +280,12 @@
     postText = postText.replace(/^[a-zA-Z0-9][a-zA-Z0-9 \u00a0]{20,}$/gm, '').trim();
 
     // Strip junk short URLs from link previews (random 4-10 char domains)
-    postText = postText.replace(/^[a-zA-Z0-9]{2,15}\.(com|net|org)\s*$/gm, '').trim();
+    // Match both standalone lines AND trailing occurrences (e.g. "【Title】shorturl.com")
+    postText = postText.replace(/^[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
+    postText = postText.replace(/\s*[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
 
-    // Strip m.me fragments (Messenger links) anywhere
-    postText = postText.replace(/^m\.me\s*$/gm, '').trim();
+    // Strip m.me fragments (Messenger links) — standalone or trailing
+    postText = postText.replace(/\s*m\.me\s*$/gm, '').trim();
 
     // Strip comment/share section that leaked into post text
     // This catches: "N comments", "N shares", "View more comments", commenter text
@@ -623,21 +643,46 @@
   }
 
   // Find all post text elements on the page and process their containers
+  let _lastScanTime = 0;
   function scanForPosts() {
     if (!isActive) return;
-    // Find all dir="auto" elements with meaningful text content
-    const allDirAuto = document.querySelectorAll('div[dir="auto"], span[dir="auto"]');
+
+    // Throttle: after 150+ posts, scans become expensive (16000+ elements).
+    // Enforce a minimum gap between scans to avoid starving Facebook's
+    // rendering pipeline.  Early on, scans are fast so no throttle needed.
+    const now = Date.now();
+    const minGap = processedHashes.size > 150 ? 2000 : 0;
+    if (now - _lastScanTime < minGap) return;
+    _lastScanTime = now;
+
+    // Find all dir="auto" elements with meaningful text content.
+    // Scope to the feed container when possible — the full document can have
+    // 16000+ dir="auto" elements (nav, sidebar, chat), but the feed has ~200.
+    const feedContainer = document.querySelector('[data-virtualized]');
+    const scope = (feedContainer && feedContainer.parentElement) || document;
+    const allDirAuto = scope.querySelectorAll('div[dir="auto"], span[dir="auto"]');
     const seenContainers = new Set();
 
     let found = 0;
     let skipReasons = { short: 0, ui: 0, noContainer: 0, seen: 0, done: 0, checked: 0, nested: 0 };
     for (const el of allDirAuto) {
-      const text = el.innerText.trim();
+      // IMPORTANT: use textContent (not innerText) for the initial filter.
+      // innerText forces a synchronous layout reflow on EVERY call.
+      // With 16000+ elements, that's 16000+ forced reflows per scan — this
+      // is the root cause of Facebook UI freezing after 200+ posts.
+      // textContent is orders of magnitude cheaper (pure DOM string read).
+      const text = el.textContent.trim();
       // Must have some real content (not just UI labels)
       if (text.length < 8) { skipReasons.short++; continue; }
       // Skip known UI patterns
       if (/^(switch into|you're commenting|manage|boost this|write a comment)/i.test(text)) { skipReasons.ui++; continue; }
       if (/^(like|comment|share|send|reply|follow|sponsored|facebook)$/i.test(text)) { skipReasons.ui++; continue; }
+
+      // Quick ancestor check: skip elements inside containers already
+      // marked as processed.  This avoids the expensive findPostContainer
+      // walk-up for thousands of elements inside already-scraped posts.
+      // Uses native closest() which is much faster than our custom walk-up.
+      if (el.closest('[data-fb-scraper-done]')) { skipReasons.done++; continue; }
 
       // Find the post container for this text element
       const container = findPostContainer(el);
@@ -672,6 +717,40 @@
         continue;
       }
 
+      // Early permalink check: skip recycled DOM nodes whose post was
+      // already captured.  Facebook's virtualization recreates nodes without
+      // our data-markers, causing the same posts to be re-discovered every
+      // scan cycle.  This avoids the expensive processPost work (clickSeeMore,
+      // extractPostText, extractTimestamp) for already-captured posts.
+      const quickLink = container.querySelector('a[href*="/posts/"], a[href*="/photo/"], a[href*="story_fbid"], a[href*="/videos/"], a[href*="pfbid"]');
+      if (quickLink) {
+        try {
+          // Must mirror cleanPermalink logic: strip search but preserve
+          // identifying params (fbid, story_fbid, v).  Without this, the
+          // quick permalink won't match the one stored by processPost.
+          const qUrl = new URL(quickLink.href, 'https://www.facebook.com');
+          const qFbid = qUrl.searchParams.get('fbid');
+          const qStoryFbid = qUrl.searchParams.get('story_fbid');
+          const qVideoId = qUrl.searchParams.get('v');
+          qUrl.search = '';
+          if (qFbid) qUrl.searchParams.set('fbid', qFbid);
+          if (qStoryFbid) qUrl.searchParams.set('story_fbid', qStoryFbid);
+          if (qVideoId) qUrl.searchParams.set('v', qVideoId);
+          const qPermalink = qUrl.toString();
+          if (processedPermalinks.has(qPermalink)) {
+            const prevLen = processedPermalinks.get(qPermalink);
+            // Only skip if previous capture was substantial (>= 200 chars).
+            // Short captures may be truncated (baseline text from virtualized
+            // containers) — allow re-processing so expanded text can replace.
+            if (prevLen >= 200) {
+              container.dataset.fbScraperDone = 'true';
+              skipReasons.done++;
+              continue;
+            }
+          }
+        } catch (e) { /* ignore URL parse errors */ }
+      }
+
       found++;
       processPost(container);
     }
@@ -697,13 +776,19 @@
       console.log(`[FB Scraper] Scan found 0 new containers (stall: ${stallCount}/${MAX_STALL}) | emptyScanStreak: ${_consecutiveEmptyScans} | dirAuto: ${allDirAuto.length} | skips: short=${skipReasons.short} ui=${skipReasons.ui} noContainer=${skipReasons.noContainer} seen=${skipReasons.seen} done=${skipReasons.done} checked=${skipReasons.checked} nested=${skipReasons.nested}`);
     }
 
+    // Skip second and third passes when scans are consistently empty —
+    // no point iterating 16000+ elements again when the feed shows skeletons.
+    if (_consecutiveEmptyScans < 5) {
+
     // Second pass: look for dir="auto" elements with substantial text that
     // the main pipeline missed (findPostContainer returned null because all
     // ancestors were already marked).  These are posts nested inside another
     // post's container due to Facebook's DOM structure.
     for (const el of allDirAuto) {
-      const text = el.innerText.trim();
+      const text = el.textContent.trim();
       if (text.length < 100) continue;
+      // Skip elements inside already-processed containers
+      if (el.closest('[data-fb-scraper-done]')) continue;
       // Only process elements where findPostContainer would return null
       const container = findPostContainer(el);
       if (container) continue;  // main pipeline handles this
@@ -746,8 +831,10 @@
     // Strategy: find "Facebook" dir="auto" elements, walk up to the first
     // large ancestor (children >= 10), verify it has a heading AND permalink.
     for (const el of allDirAuto) {
-      const text = el.innerText.trim();
+      const text = el.textContent.trim();
       if (text.toLowerCase() !== 'facebook') continue;
+      // Skip elements inside already-processed containers
+      if (el.closest('[data-fb-scraper-done]')) continue;
 
       // Walk up to find the first large container (children >= 10)
       let container = null;
@@ -801,30 +888,72 @@
       console.log('[FB Scraper] Third pass: processing photo-only post candidate');
       processPost(container);
     }
+
+    } // end if (_consecutiveEmptyScans < 5)
   }
 
   function processPost(container) {
     if (!isActive) return;
+
+    // Capture baseline text BEFORE clicking "See more", in case Facebook's
+    // virtualization removes the container during the expansion delay.
+    // Without this, posts deeper in the feed (100+) get lost because the
+    // 600ms delay gives virtualization time to recycle the DOM node.
+    const baselineText = extractPostText(container);
+    const baselineAuthor = extractAuthor(container);
+    // Capture timestamp/permalink early only if "See more" will be clicked
+    // (delay > 0 means container may be virtualized away).  extractTimestamp
+    // is expensive (queries all links + spans), so skip it when no delay.
+    let baselineTimestamp = null;
+
     // Click "See more" to expand, then extract after delay
     const clicked = clickSeeMore(container);
-    const delay = clicked ? 400 : 0;
+    const delay = clicked ? 600 : 0;
+
+    // Capture timestamp only when there's a delay (risk of virtualization)
+    if (delay > 0) {
+      baselineTimestamp = extractTimestamp(container);
+    }
+
+    // If "See more" was clicked, do a quick mid-delay check at 300ms.
+    // If the container is still attached, re-extract to get expanded text
+    // before the full 600ms (when virtualization is more likely to remove it).
+    let midText = null;
+    let midAuthor = null;
+    if (clicked) {
+      setTimeout(() => {
+        if (!isActive || !document.contains(container)) return;
+        midText = extractPostText(container);
+        midAuthor = extractAuthor(container);
+      }, 300);
+    }
 
     setTimeout(() => {
       // Guard: if scraping was stopped during the delay, abort
       if (!isActive) return;
 
-      // Guard: if the container was detached from the DOM (e.g. after sleep),
-      // skip extraction — the post will be re-discovered on the next scan
+      let postText, author;
+
       if (!document.contains(container)) {
-        console.log('[FB Scraper] Skipped detached container (DOM node removed, likely after sleep)');
-        return;
+        // Container was virtualized away during the delay.
+        // Use the best available capture: mid-delay > baseline.
+        const bestText = (midText && midText.length > (baselineText || '').length) ? midText : baselineText;
+        const bestAuthor = midAuthor || baselineAuthor;
+        if (!bestText && !bestAuthor) {
+          console.log('[FB Scraper] Skipped detached empty container');
+          return;
+        }
+        console.log('[FB Scraper] Using', midText ? 'mid-delay' : 'baseline',
+          'text (container virtualized during See more delay) |',
+          (bestText || '').length, 'chars');
+        postText = bestText;
+        author = bestAuthor;
+      } else {
+        // Container still in DOM — extract expanded text
+        if (clicked) clickSeeMore(container);
+        postText = extractPostText(container);
+        author = extractAuthor(container);
       }
-
-      // Click again in case expansion revealed more
-      if (clicked) clickSeeMore(container);
-
-      let postText = extractPostText(container);
-      const author = extractAuthor(container);
 
       // Safeguard: trim extremely long posts to prevent performance issues
       const MAX_POST_LENGTH = 10000;
@@ -880,7 +1009,10 @@
         container.dataset.fbScraperDone = 'true';
       }
 
-      const { timestamp, permalink } = extractTimestamp(container);
+      // Use pre-captured timestamp/permalink if container was virtualized away
+      const { timestamp, permalink } = document.contains(container)
+        ? extractTimestamp(container)
+        : (baselineTimestamp || { timestamp: '', permalink: '' });
 
       // Reject non-post content (notifications, footer, comment counts)
       const trimmedText = postText.trim();
@@ -1039,7 +1171,8 @@
   let _scrollBackTarget = -1;
   let _consecutiveEmptyScans = 0; // tracks how many scans found 0 new captures
   let _lastCapturedCount = 0; // tracks processedHashes.size for empty scan detection
-  const SCROLL_BACK_SUPPRESS_THRESHOLD = 4; // disable scroll-back after this many empty scans
+  const SCROLL_BACK_SUPPRESS_THRESHOLD = 3; // disable scroll-back after this many empty scans
+  let _scrollBackSuppressedUntil = 0; // timestamp: suppress scroll-back until this time
 
   // Detect large scroll jumps from Facebook's virtualization.
   // When a forward jump > 800px is detected, immediately scan to catch
@@ -1053,10 +1186,15 @@
       // Large forward jump — scan immediately
       scanForPosts();
 
-      // Only scroll back if recent scans are finding new posts.
-      // If we've had several empty scans, the current area is fully scraped
-      // and scroll-back would trap us in a loop.
-      if (_consecutiveEmptyScans < SCROLL_BACK_SUPPRESS_THRESHOLD) {
+      // Only scroll back for normal-sized jumps (< 5000px) caused by
+      // "See more" text expansion.  Larger jumps are Facebook's feed
+      // virtualization reorganizing the page (especially after ~200 posts),
+      // which can momentarily reset scrollY to 0.  Scrolling back from
+      // such a massive delta would send the user to the very beginning.
+      // Also suppress if recent scans found no new posts (area fully scraped),
+      // and keep suppressed for 5s so the scraper can advance past the area.
+      const now = Date.now();
+      if (delta < 5000 && _consecutiveEmptyScans < SCROLL_BACK_SUPPRESS_THRESHOLD && now >= _scrollBackSuppressedUntil) {
         console.log('[FB Scraper] Scroll jump +' + delta + ', scanning & scrolling back');
         _scrollBackTarget = _prevScrollY;
         requestAnimationFrame(() => {
@@ -1066,7 +1204,15 @@
           }
         });
       } else {
-        console.log('[FB Scraper] Scroll jump +' + delta + ', scanning (scroll-back suppressed, advancing to new area)');
+        const reason = delta >= 5000 ? 'feed reorganization' :
+          now < _scrollBackSuppressedUntil ? 'cooldown active' : 'area fully scraped';
+        console.log('[FB Scraper] Scroll jump +' + delta + ', scanning (scroll-back suppressed —', reason, ')');
+        // When suppressed due to empty scans, set a cooldown so scroll-back
+        // stays off for 5s even if a new capture briefly resets the counter.
+        // This prevents the one-post-per-jump-back-cycle stutter in late stages.
+        if (_consecutiveEmptyScans >= SCROLL_BACK_SUPPRESS_THRESHOLD) {
+          _scrollBackSuppressedUntil = now + 5000;
+        }
       }
     }
     _prevScrollY = curY;
@@ -1074,23 +1220,23 @@
 
   function startAutoScroll() {
     if (autoScrollInterval) return;
-    let expectedTickCount = 0;
-    const scrollStartTime = Date.now();
+    let lastTickTime = Date.now();
     autoScrollInterval = setInterval(() => {
-      expectedTickCount++;
       const now = Date.now();
-      const wallElapsed = now - scrollStartTime;
-      const expectedElapsed = expectedTickCount * SCROLL_INTERVAL;
+      const tickGap = now - lastTickTime;
+      lastTickTime = now;
 
-      // Wake detection: if wall clock is far ahead of expected ticks,
-      // the system slept and Chrome is firing accumulated ticks in a burst
-      if (wallElapsed > expectedElapsed + SCROLL_INTERVAL * 4) {
-        // Fast-forward the tick counter to match wall clock, absorbing the burst
-        expectedTickCount = Math.ceil(wallElapsed / SCROLL_INTERVAL);
-        console.log('[FB Scraper] Wake detected (wall drift: ' + Math.round((wallElapsed - expectedElapsed) / 1000) + 's), resetting counters | posts so far:', processedHashes.size, '| scrollY:', Math.round(window.scrollY));
+      // Wake detection: if the gap between this tick and the previous one
+      // is very large (>15s), the system likely slept.  We use per-tick gap
+      // instead of cumulative drift because slow scans (1-2s each when the
+      // DOM has 16000+ elements) cause gradual cumulative drift that falsely
+      // triggers the old detector, resetting stall counters in a loop.
+      if (tickGap > 15000) {
+        console.log('[FB Scraper] Wake detected (tick gap: ' + Math.round(tickGap / 1000) + 's), resetting counters | posts so far:', processedHashes.size, '| scrollY:', Math.round(window.scrollY));
         stallCount = 0;
         autoRetryCount = 0;
         _consecutiveEmptyScans = 0;
+        _scrollBackSuppressedUntil = 0; // clear cooldown after wake
         _lastCapturedCount = processedHashes.size;
         lastPostCount = processedHashes.size;
         lastDocHeight = document.documentElement.scrollHeight;
@@ -1174,9 +1320,11 @@
         return;
       }
 
-      // Debounce: don't scan on every tiny mutation
+      // Debounce: don't scan on every tiny mutation.
+      // Use longer debounce after 150+ posts to reduce CPU pressure.
+      const debounceMs = processedHashes.size > 150 ? 1000 : 300;
       clearTimeout(observer._debounce);
-      observer._debounce = setTimeout(scanForPosts, 300);
+      observer._debounce = setTimeout(scanForPosts, debounceMs);
     });
 
     observer.observe(document.body, { childList: true, subtree: true });
@@ -1188,7 +1336,7 @@
       const elapsed = now - scanLastTickTime;
       scanLastTickTime = now;
 
-      if (elapsed > SCAN_INTERVAL * 5) {
+      if (elapsed > 15000) {
         console.log('[FB Scraper] Scanner wake detected (gap: ' + Math.round(elapsed / 1000) + 's), skipping stale tick');
         return; // skip this tick — DOM is likely stale
       }
