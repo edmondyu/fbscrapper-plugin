@@ -110,6 +110,21 @@
     return hash.toString();
   }
 
+  // Cheap check for whether a DOM element contains at least minLength chars
+  // of text.  Uses a TreeWalker that stops as soon as the threshold is met —
+  // never builds a full concatenated string.  Safe to call on large containers
+  // near the DOM root where textContent would produce multi-MB strings.
+  function hasSubstantialText(el, minLength) {
+    let total = 0;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+    let node;
+    while ((node = walker.nextNode())) {
+      total += node.nodeValue.length;
+      if (total >= minLength) return true;
+    }
+    return false;
+  }
+
   // Walk up from a text element to find its post container.
   // Facebook uses a virtualized feed (data-virtualized attribute) where each
   // direct child is one post.  We stop just below that boundary so each post
@@ -128,21 +143,17 @@
         return lastCandidate || p;
       }
 
-      // Original heuristic: container with many children
-      if (p.children.length >= 10 && p.innerText.length > 100) {
+      // Original heuristic: container with many children.
+      // Use hasSubstantialText instead of p.innerText.length — innerText
+      // forces a layout reflow, and textContent on large containers builds
+      // a multi-MB string.  TreeWalker bails out early at the threshold.
+      if (p.children.length >= 10 && hasSubstantialText(p, 100)) {
         if (isNonPostContainer(p)) continue;
         if (p.querySelector('a[href]') === null) continue;
-        // If we already found a good post-like candidate closer to the
-        // text element, prefer it over this larger container (which is
-        // likely a page-level wrapper, not an individual post)
         return lastCandidate || p;
       }
 
-      // Track the best post-like container as we walk up.
-      // A post container has 3+ children, a link, some text, and an author
-      // indicator (heading OR strong tag — Facebook uses different elements
-      // for different posts on the same page).
-      if (p.children.length >= 3 && p.querySelector('a[href]') && p.innerText.length > 20) {
+      if (p.children.length >= 3 && p.querySelector('a[href]') && hasSubstantialText(p, 20)) {
         const hasAuthor = p.querySelector('h2, h3, h4, h5, h6, strong');
         if (hasAuthor) {
           if (!lastCandidate || p.children.length > lastCandidate.children.length) {
@@ -623,8 +634,18 @@
   }
 
   // Find all post text elements on the page and process their containers
+  let _lastScanTime = 0;
   function scanForPosts() {
     if (!isActive) return;
+    // Throttle scans after 150+ posts to give Facebook's rendering pipeline
+    // CPU time.  At 150+ posts the DOM has grown large and each scan is
+    // noticeably heavier, even with textContent.  Before 150 posts scans are
+    // fast enough that no throttle is needed.
+    const nowScan = Date.now();
+    const minScanGap = processedHashes.size > 150 ? 2000 : 0;
+    if (nowScan - _lastScanTime < minScanGap) return;
+    _lastScanTime = nowScan;
+
     // Find all dir="auto" elements with meaningful text content
     const allDirAuto = document.querySelectorAll('div[dir="auto"], span[dir="auto"]');
     const seenContainers = new Set();
@@ -632,7 +653,12 @@
     let found = 0;
     let skipReasons = { short: 0, ui: 0, noContainer: 0, seen: 0, done: 0, checked: 0, nested: 0 };
     for (const el of allDirAuto) {
-      const text = el.innerText.trim();
+      // Use textContent (not innerText) for the filter check.
+      // innerText triggers a synchronous layout reflow on every call.
+      // With 10000+ elements this causes Facebook's UI to freeze and
+      // eventually crash the tab.  textContent is a pure string read —
+      // no layout, no reflow.  Per-post extraction still uses innerText.
+      const text = el.textContent.trim();
       // Must have some real content (not just UI labels)
       if (text.length < 8) { skipReasons.short++; continue; }
       // Skip known UI patterns
@@ -702,7 +728,7 @@
     // ancestors were already marked).  These are posts nested inside another
     // post's container due to Facebook's DOM structure.
     for (const el of allDirAuto) {
-      const text = el.innerText.trim();
+      const text = el.textContent.trim();
       if (text.length < 100) continue;
       // Only process elements where findPostContainer would return null
       const container = findPostContainer(el);
@@ -746,7 +772,7 @@
     // Strategy: find "Facebook" dir="auto" elements, walk up to the first
     // large ancestor (children >= 10), verify it has a heading AND permalink.
     for (const el of allDirAuto) {
-      const text = el.innerText.trim();
+      const text = el.textContent.trim();
       if (text.toLowerCase() !== 'facebook') continue;
 
       // Walk up to find the first large container (children >= 10)
@@ -1174,9 +1200,12 @@
         return;
       }
 
-      // Debounce: don't scan on every tiny mutation
+      // Debounce: don't scan on every tiny mutation.
+      // After 150+ posts the DOM is large so use a longer debounce to
+      // batch mutations and avoid firing expensive scans too frequently.
+      const debounceMs = processedHashes.size > 150 ? 800 : 300;
       clearTimeout(observer._debounce);
-      observer._debounce = setTimeout(scanForPosts, 300);
+      observer._debounce = setTimeout(scanForPosts, debounceMs);
     });
 
     observer.observe(document.body, { childList: true, subtree: true });
