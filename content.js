@@ -856,7 +856,7 @@
     if (!isActive) return;
     // Click "See more" to expand, then extract after delay
     const clicked = clickSeeMore(container);
-    const delay = clicked ? 600 : 0;
+    const delay = clicked ? 400 : 0;
 
     setTimeout(() => {
       // Guard: if scraping was stopped during the delay, abort
