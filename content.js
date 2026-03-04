@@ -190,7 +190,7 @@
   // Text patterns that match "See more" buttons in various languages
   const SEE_MORE_TEXTS = new Set([
     'see more', 'see more…', '...see more', '… see more',
-    '顯示更多', '查看更多', '展開',
+    '顯示更多', '查看更多', '展開', '展開全文', '顯示全文', '閱讀更多',
   ]);
 
   // Click "See more" links within a container
@@ -265,6 +265,9 @@
     postText = postText.replace(/…?\s*顯示更多\s*/gi, '').trim();
     postText = postText.replace(/…?\s*查看更多\s*/gi, '').trim();
     postText = postText.replace(/…?\s*展開\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*展開全文\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*顯示全文\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*閱讀更多\s*/gi, '').trim();
 
     // Strip repeated "Facebook" lines (navigation noise leaking into post text)
     postText = postText.replace(/^(Facebook\n)+/g, '').trim();
@@ -1019,32 +1022,34 @@
           const retryClicked = clickSeeMore(container);
           if (retryClicked) {
             console.log('[FB Scraper] Retry: clicked See more for', author, '|', postText.substring(0, 30));
-            setTimeout(() => {
-              if (!document.contains(container)) return;
-              let retryText = extractPostText(container);
-              if (retryText.length > MAX_POST_LENGTH) {
-                console.warn('[FB Scraper] Retry text extremely long (' + retryText.length + ' chars), trimming to ' + MAX_POST_LENGTH);
-                retryText = '[attention: post text too long, content is trimmed] ' + retryText.substring(0, MAX_POST_LENGTH);
-              }
-              if (retryText.length > postText.length) {
-                console.log('[FB Scraper] Retry: expanded', postText.length, '->', retryText.length, 'chars');
-                const retryPost = { ...post, postText: retryText, scrapedAt: new Date().toISOString() };
-                if (permalink) processedPermalinks.set(permalink, retryText.length);
-                const retryHash = hashString(author + retryText);
-                processedHashes.add(retryHash);
-                processedPrefixes.set(retryPrefixKey, { textLength: retryText.length, hash: retryHash });
-                const retryMsg = { type: 'REPLACE_POST', post: retryPost };
-                if (permalink) {
-                  // Match by permalink
-                } else {
-                  // Match by prefix
-                  retryMsg.matchPrefix = postText.substring(0, PREFIX_LEN);
-                  retryMsg.matchAuthor = author;
-                }
-                chrome.runtime.sendMessage(retryMsg);
-              }
-            }, 500);
           }
+          // Always re-extract: if See more was already clicked in the first pass,
+          // the expansion may not have finished within the initial 400ms delay.
+          // By the time this retry runs (1000ms later), the text is fully expanded.
+          // Use 500ms delay only if we just clicked; 0ms if already expanded.
+          const retryDelay = retryClicked ? 500 : 0;
+          setTimeout(() => {
+            if (!document.contains(container)) return;
+            let retryText = extractPostText(container);
+            if (retryText.length > MAX_POST_LENGTH) {
+              console.warn('[FB Scraper] Retry text extremely long (' + retryText.length + ' chars), trimming to ' + MAX_POST_LENGTH);
+              retryText = '[attention: post text too long, content is trimmed] ' + retryText.substring(0, MAX_POST_LENGTH);
+            }
+            if (retryText.length > postText.length) {
+              console.log('[FB Scraper] Retry: expanded', postText.length, '->', retryText.length, 'chars');
+              const retryPost = { ...post, postText: retryText, scrapedAt: new Date().toISOString() };
+              if (permalink) processedPermalinks.set(permalink, retryText.length);
+              const retryHash = hashString(author + retryText);
+              processedHashes.add(retryHash);
+              processedPrefixes.set(retryPrefixKey, { textLength: retryText.length, hash: retryHash });
+              const retryMsg = { type: 'REPLACE_POST', post: retryPost };
+              if (!permalink) {
+                retryMsg.matchPrefix = postText.substring(0, PREFIX_LEN);
+                retryMsg.matchAuthor = author;
+              }
+              chrome.runtime.sendMessage(retryMsg);
+            }
+          }, retryDelay);
         }, 1000);
       }
     }, delay);
