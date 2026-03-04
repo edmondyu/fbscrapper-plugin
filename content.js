@@ -856,7 +856,7 @@
     if (!isActive) return;
     // Click "See more" to expand, then extract after delay
     const clicked = clickSeeMore(container);
-    const delay = clicked ? 400 : 0;
+    const delay = clicked ? 600 : 0;
 
     setTimeout(() => {
       // Guard: if scraping was stopped during the delay, abort
@@ -982,9 +982,17 @@
         container.dataset.fbScraperDone = 'true';
         return;
       }
-      processedHashes.add(key);
+      // For short captures (<200 chars) where a permalink is known, skip the hash
+      // and prefix registrations. Different posts in a series can share the same
+      // truncated title (e.g. 【水晶晶 之延伸閱讀篇】), causing hash/prefix collisions
+      // that silently drop the second post. Permalink dedup is sufficient to detect
+      // true same-post duplicates; hash/prefix are only needed when there's no permalink.
+      const isShortWithPermalink = postText.length < 200 && !!permalink;
+      if (!isShortWithPermalink) {
+        processedHashes.add(key);
+        processedPrefixes.set(prefixKey, { textLength: postText.length, hash: key });
+      }
       if (permalink) processedPermalinks.set(permalink, postText.length);
-      processedPrefixes.set(prefixKey, { textLength: postText.length, hash: key });
 
       const reactions = extractReactions(container);
       const comments = extractComments(container);
