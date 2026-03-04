@@ -272,11 +272,16 @@
     // These contain mixed letters+digits with no punctuation, often with \xa0 (non-breaking space)
     postText = postText.replace(/^[a-zA-Z0-9][a-zA-Z0-9 \u00a0]{20,}$/gm, '').trim();
 
-    // Strip junk short URLs from link previews (random 4-10 char domains)
-    postText = postText.replace(/^[a-zA-Z0-9]{2,15}\.(com|net|org)\s*$/gm, '').trim();
+    // Strip junk short URLs from link previews (random 4-10 char domains).
+    // Two patterns needed:
+    //   1. Standalone line: "NR42jdCK.com" on its own line
+    //   2. Trailing suffix: "【Title】NR42jdCK.com" appended to post title
+    postText = postText.replace(/^[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
+    postText = postText.replace(/\s*[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
 
-    // Strip m.me fragments (Messenger links) anywhere
+    // Strip m.me fragments (Messenger links) — standalone line or trailing suffix
     postText = postText.replace(/^m\.me\s*$/gm, '').trim();
+    postText = postText.replace(/\s*m\.me\s*$/gm, '').trim();
 
     // Strip comment/share section that leaked into post text
     // This catches: "N comments", "N shares", "View more comments", commenter text
