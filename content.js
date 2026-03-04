@@ -242,6 +242,9 @@
       if (/^(boost|insights|promote|advertise)/i.test(lower)) continue;
       if (/^(switch into|you're commenting|manage|write a comment)/i.test(lower)) continue;
       if (/^boost this post/i.test(lower)) continue;
+      // Skip page header / profile section labels that leak into post containers
+      if (/^(send message|message|like page|follow page|get directions|call now|shop now|book now|sign up|learn more|watch more|contact us)$/i.test(lower)) continue;
+      if (/^(personal blog|public figure|politician|musician|actor|director|artist|writer|journalist|news|media|business|brand|community|organisation|nonprofit)$/i.test(lower)) continue;
 
       texts.push(text);
     }
@@ -273,15 +276,27 @@
     postText = postText.replace(/^[a-zA-Z0-9][a-zA-Z0-9 \u00a0]{20,}$/gm, '').trim();
 
     // Strip junk short URLs from link previews (random 4-10 char domains).
-    // Two patterns needed:
-    //   1. Standalone line: "NR42jdCK.com" on its own line
-    //   2. Trailing suffix: "【Title】NR42jdCK.com" appended to post title
+    // Three patterns needed:
+    //   1. Standalone line:  "NR42jdCK.com" on its own line
+    //   2. Trailing suffix:  "【Title】NR42jdCK.com" at end of line
+    //   3. Inline (middle):  "【Title】NR42jdCK.com 【Title】" — URL between two
+    //      copies of the post title.  Replace with newline so the line-level
+    //      dedup below can eliminate the resulting duplicate.
     postText = postText.replace(/^[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
     postText = postText.replace(/\s*[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
+    postText = postText.replace(/\s+[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s+/g, '\n').trim();
 
-    // Strip m.me fragments (Messenger links) — standalone line or trailing suffix
+    // Strip m.me fragments (Messenger links) — standalone, trailing, or inline
     postText = postText.replace(/^m\.me\s*$/gm, '').trim();
     postText = postText.replace(/\s*m\.me\s*$/gm, '').trim();
+    postText = postText.replace(/\s+m\.me\s+/g, '\n').trim();
+
+    // Strip page header noise: "PageName Personal blog Send message" or
+    // "PageName Public figure Message" trailing on a post title line.
+    // This leaks in when the post container is large enough to include
+    // the page profile section above the feed.
+    postText = postText.replace(/\s+(personal blog|public figure|politician|musician|actor|writer|journalist|news|media|business|community|nonprofit)\s+(send message|message|follow|like page)\s*$/gi, '').trim();
+    postText = postText.replace(/\n.*?(personal blog|public figure|politician|musician|actor|writer|journalist|news|media|business|community|nonprofit).*?(send message|message).*$/gi, '').trim();
 
     // Strip comment/share section that leaked into post text
     // This catches: "N comments", "N shares", "View more comments", commenter text
