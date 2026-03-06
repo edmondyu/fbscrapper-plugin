@@ -22,9 +22,11 @@ A Chrome extension (Manifest V3) that scrapes Facebook posts as you scroll throu
   - Junk timestamp cleanup
 - **Text quality**:
   - Auto-expands "See more" links before scraping, with async retry for short captures
+  - **Truncated text recovery** — multi-layer rescue chain for posts whose body text is not in `dir="auto"` elements (e.g. photo post captions rendered in `span[dir=none]`): immediate `innerText` fallback at capture time, DupSkip rescue on scroll-back re-encounter, and RetryA fallback
   - Three-layer deduplication: permalink, text prefix, and content hash
   - Strips Facebook UI noise (navigation, button labels, notification panels)
   - Handles scrambled "Sponsored" text obfuscation (including `\u00a0` non-breaking spaces)
+- **Performance at scale** — `WeakSet`-based element tracking eliminates redundant DOM walks on 10 000+ element pages; scan cost stays near-constant regardless of how many posts have been scraped
 - **Timestamp extraction** — 5-strategy approach to find timestamps from various Facebook DOM patterns, including Chinese date formats
 - Supports English and Chinese (Traditional/Simplified) Facebook interfaces
 
@@ -178,6 +180,28 @@ Posts exceeding 10,000 characters are automatically trimmed to prevent browser p
 ### Post-Extraction Garbage Filtering
 Facebook pages contain many non-post elements (notifications, footer text, comment counts, page info) that can slip through container detection. The scraper filters these at the extraction stage by rejecting text matching patterns like notification items (`Unread...`), comment counts (`N comments`), footer text (`Privacy · Terms`), and page details (`Details ... recommend`).
 
+### Truncated Text Recovery (v1.3.0)
+
+Some posts have their body text outside `dir="auto"` elements — for example, photo post captions that Facebook renders in `span[dir=none]` after "See more" expansion. `extractPostText` (which only reads `dir="auto"]`) captures only the short first-line title for these posts (typically < 50 chars).
+
+**Root cause of the 100+ post degradation**: Facebook aggressively virtualizes the DOM for performance. After ~100 posts have been scraped, containers that have scrolled off-screen have their body content stripped from the DOM. By the time the retry chain fires (2 seconds after capture), the container's `dir="auto"` elements contain only the title and `innerText` is also empty.
+
+**Solution — `extractPostTextFallback`**: A fallback function that reads `container.innerText` line-by-line and filters Facebook UI noise. It is called at three points:
+
+1. **Immediate fallback** (at initial capture time, ~400ms after finding the container): fires while the container is still in/near the viewport and content is accessible, before Facebook virtualizes it. If `extractPostText` returns < 50 chars, the fallback is tried immediately and the result is used for the initial `NEW_POST` message if longer.
+2. **DupSkip rescue** (when the same container is re-encountered via scroll-back): if stored text is < 50 chars, try again — the container is now back in the viewport.
+3. **RetryA fallback rescue** (~2s after capture): last-chance attempt before the retry chain escalates to See More clicking. Guarded by `storedLen` to avoid overwriting a better DupSkip result.
+
+**Preprocessing in `extractPostTextFallback`**:
+- Truncates `workingRaw` at `All reactions:` — this is a definitive end-of-content marker and also handles scrambled Facebook obfuscation codes placed on the same line immediately before `All reactions:`.
+- Removes `m.me` Messenger links inline (they appear concatenated with the post title, no newline separator).
+- Removes `Photos from [Author]'s post` attribution inline.
+- Line-level filters cover action bar, timestamps, audience labels, reaction name lists, scrambled alphanumeric codes, and Facebook UI patterns.
+
+**Known remaining issues** (< 1% of posts):
+- A small number of posts may still contain irrelevant fragments (e.g. Facebook attribution text that slipped past the inline preprocessing, or reaction/comment section content on unusual DOM layouts).
+- A small number of posts may appear as duplicates when REPLACE_POST matching fails (background.js couldn't match the post by permalink, creating a second entry instead of replacing the first).
+
 ### Photo-Only Post Detection (v1.2.0)
 
 Photo-only posts (posts with just an image and no text) were invisible to the main scanner because:
@@ -211,6 +235,17 @@ The third pass uses the very "Facebook" text that the main scan filters out as a
 
 When the third pass finds a container that is a LARGER ancestor of an already-captured post (rather than the photo-only post), the larger container includes extra DOM content like link preview URLs (e.g. `NR42jdCK.com`, `c9kozB5P.com`, `1G59eKq.com`). This produces duplicated post text with junk short URLs inserted. The overlap guard (step 4 above) prevents this by skipping containers that already have captured posts inside them. Additionally, "facebook" was added to the `extractPostText` filter to ensure the anti-scraping "Facebook" padding text is excluded from extracted post content.
 
+### Scan Performance at Scale (v1.3.0)
+
+At 300+ posts the Facebook page DOM contains 10 000+ `dir="auto"` elements. The scan loop previously called `findPostContainer()` (a DOM tree walk) on thousands of already-evaluated elements every 1.2 seconds, causing visible slowdown.
+
+**Solution — `_scanSeenElements` WeakSet**: A module-level `WeakSet` records every `dir="auto"` element after it has been fully evaluated (regardless of outcome). On subsequent scans the element is skipped in O(1) before any text read or DOM walk. Because it is a `WeakSet`, elements that Facebook removes (DOM virtualization) are garbage-collected automatically.
+
+- Before: ~3 800 `findPostContainer` calls per scan at 300 posts.
+- After: ~50 calls per scan (only truly new elements from Facebook's infinite scroll).
+
+The MutationObserver debounce also scales: 300ms → 800ms (after 150 posts) → 1 500ms (after 300 posts) to batch the burst of mutations Facebook generates when loading new posts.
+
 ### Key Architectural Insights
 1. **Work WITH Facebook's virtualization, not against it**: Use `scrollBy` (relative) rather than `scrollTo` (absolute). Let Facebook manage its DOM window, but recover when it jumps.
 2. **The virtual window is ~3000-4000px**: Facebook keeps roughly this much content rendered. Scroll jumps of similar magnitude confirm this — they represent the entire window shifting.
@@ -227,6 +262,8 @@ When the third pass finds a container that is a LARGER ancestor of an already-ca
 - Auto-scroll may stall on very long timelines; the extension auto-retries but may eventually stop
 - **Post ordering**: Posts may occasionally appear out of order in the CSV due to timing differences between the main scan and the third-pass photo-only detection
 - **Posts deep in the feed** may be missed if Facebook's virtualized feed removes them from the DOM before the scanner processes them
+- **Irrelevant fragments in post text** (< 1% of posts): Facebook attribution text (`Photos from X's post`), Messenger links (`m.me/...`), or reaction/comment section content may appear in captured text when they share a DOM line with post content and slip past the inline preprocessing filters in `extractPostTextFallback`.
+- **Duplicate posts** (< 1% of posts): When `REPLACE_POST` matching fails (background.js cannot find the original entry by permalink), a second CSV entry is created for the same post — one with the short initial capture, one with the rescued full text.
 
 ## License
 

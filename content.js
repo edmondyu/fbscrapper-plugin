@@ -16,6 +16,11 @@
   const processedHashes = new Set();
   const processedPermalinks = new Map(); // permalink -> text length of best capture
   const processedPrefixes = new Map(); // hash(author + first 40 chars) -> { textLength, hash }
+  // WeakSet of dir="auto" elements already evaluated by the scan loop.
+  // Allows O(1) skip on subsequent scans — avoids calling findPostContainer
+  // (a DOM-tree walk) for thousands of already-processed elements every 1.2s.
+  // WeakSet holds references weakly so GC'd (Facebook-removed) nodes are freed.
+  const _scanSeenElements = new WeakSet();
   const SCAN_INTERVAL = 1200;
   const SCROLL_INTERVAL = 1500;
 
@@ -369,6 +374,116 @@
     return postText;
   }
 
+  // Fallback text extraction using container.innerText line-by-line.
+  // Used when dir="auto" elements don't hold the full text (e.g. photo post captions
+  // that Facebook renders outside dir="auto" elements after "See more" expansion).
+  // anchorText: the already-captured partial text used to locate where the post
+  // content begins within innerText, to skip navigation noise that precedes it.
+  // Posts need not have a title structure — anchorText may be any fragment from
+  // the beginning of the post as captured by extractPostText.
+  function extractPostTextFallback(container, authorName, anchorText) {
+    const raw = (container.innerText || '').trim();
+    if (!raw) return '';
+
+    let workingRaw = raw;
+
+    // When navigation noise is present, anchor to the already-captured fragment
+    // so we skip repeated "Facebook" navigation links and sidebar content above the post.
+    if (raw.includes('FacebookFacebook') || raw.length > 10000) {
+      if (!anchorText || anchorText.length < 2) return '';
+      const startIdx = raw.indexOf(anchorText);
+      if (startIdx < 0) return '';
+      workingRaw = raw.substring(startIdx);
+      // Still unreasonably large after the slice — wrong container
+      if (workingRaw.length > 10000) return '';
+    }
+
+    // Preprocess workingRaw before line-splitting to remove Facebook UI patterns
+    // that appear INLINE (no newline separator) within the container's innerText.
+
+    // Truncate at "All reactions:" — everything from here onwards is Facebook
+    // engagement UI. This also catches scrambled obfuscation codes that Facebook
+    // places on the same line immediately before "All reactions:".
+    const reactIdx = workingRaw.search(/all reactions?:/i);
+    if (reactIdx >= 0) workingRaw = workingRaw.substring(0, reactIdx);
+
+    // Remove m.me Messenger links — appear inline with the post title (no newline).
+    workingRaw = workingRaw.replace(/m\.me(\/\S*)?\s*/g, '');
+
+    // Remove photo/video attribution — "Photos from [Author]'s post" appears
+    // inline with captions on photo posts (no newline before it).
+    workingRaw = workingRaw.replace(/(?:photos?|videos?) from [^\n]*post/gi, '');
+
+    workingRaw = workingRaw.trim();
+    if (!workingRaw) return '';
+
+    const lines = workingRaw.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const texts = [];
+
+    for (const line of lines) {
+      const lower = line.toLowerCase();
+      // Stop at the Facebook action bar — everything after is noise
+      if (/^(like|comment|share|send|讚好|留言|分享)$/.test(lower)) break;
+      // Combined action bar on one line: "Like · Comment · Share"
+      if (/like.{0,5}comment.{0,5}share/i.test(lower) && lower.length < 60) break;
+      if (/^(most relevant|all comments|view more comments|write a comment)$/i.test(lower)) break;
+      // Skip author name (already stored separately)
+      if (authorName && line === authorName) continue;
+      // Same filters as extractPostText
+      if (/^(like|comment|share|send|reply|see more|hide|follow|suggested for you|sponsored|facebook|·|…)$/i.test(lower)) continue;
+      if (/^(boost|insights|promote|advertise)/i.test(lower)) continue;
+      if (/^(switch into|you're commenting|manage|write a comment)/i.test(lower)) continue;
+      if (/^boost this post/i.test(lower)) continue;
+      if (/^(send message|message|like page|follow page|get directions|call now|shop now|book now|sign up|learn more|watch more|contact us)$/i.test(lower)) continue;
+      if (/^(personal blog|public figure|politician|musician|actor|director|artist|writer|journalist|news|media|business|brand|community|organisation|nonprofit)$/i.test(lower)) continue;
+      if (line.length < 2) continue;
+      // Scrambled obfuscated strings (FB tracking codes, sponsored noise)
+      if (/^[a-zA-Z0-9][a-zA-Z0-9 \u00a0\t]{20,}$/.test(line)) continue;
+      if (/^\d+\s*(hr|min|h|m|d|w|sec|s)s?\s*(ago)?$/i.test(lower)) continue; // timestamps
+      if (/^(public|friends|only me|custom|followers)$/i.test(lower)) continue; // audience
+      if (/^(you,?\s|you and |\d+ others$)/.test(lower)) continue; // reaction counts
+      if (/^\d+\s*(reactions?|comments?|shares?|views?)$/.test(lower)) continue;
+      // Facebook photo/video attribution lines (standalone — inline case handled above)
+      if (/^photos? from .+post$/i.test(lower)) continue;
+      if (/^videos? from .+post$/i.test(lower)) continue;
+      // Reaction name lists: "1K Name1, Name2 and 1K others"
+      if (/\band \d+[kK]? others$/i.test(lower)) continue;
+      // Messenger shortlink (standalone — inline case handled above)
+      if (/^m\.me(\/\S+)?$/i.test(lower)) continue;
+      texts.push(line);
+    }
+
+    // Deduplicate (same as extractPostText)
+    const unique = texts.filter((t, i) => {
+      if (texts.indexOf(t) !== i) return false;
+      return !texts.some((other, j) => j !== i && other.length > t.length && other.includes(t));
+    });
+
+    let postText = unique.join('\n');
+
+    // Apply same cleanup regexes as extractPostText
+    postText = postText.replace(/…?\s*see more\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*顯示更多\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*查看更多\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*展開\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*展開全文\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*顯示全文\s*/gi, '').trim();
+    postText = postText.replace(/…?\s*閱讀更多\s*/gi, '').trim();
+    postText = postText.replace(/^(Facebook\n)+/g, '').trim();
+    postText = postText.replace(/(\nFacebook)+$/g, '').trim();
+    postText = postText.replace(/^[a-zA-Z0-9][a-zA-Z0-9 \u00a0]{20,}$/gm, '').trim();
+    postText = postText.replace(/^[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
+    postText = postText.replace(/\s*[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
+    postText = postText.replace(/^m\.me\s*$/gm, '').trim();
+    postText = postText.replace(/\s*m\.me\s*$/gm, '').trim();
+    postText = postText.replace(/\n\d+[kK]?\s*(comments?|則留言|條留言)\n[\s\S]*$/i, '').trim();
+    postText = postText.replace(/\n\d+[kK]?\s*(shares?|次分享)\n[\s\S]*$/i, '').trim();
+    postText = stripLoggedInUser(postText);
+    postText = postText.replace(/\n{3,}/g, '\n\n').trim();
+
+    return postText;
+  }
+
   // Extract author name from a post container
   function extractAuthor(container) {
     // Try headings first
@@ -676,6 +791,12 @@
     let found = 0;
     let skipReasons = { short: 0, ui: 0, noContainer: 0, seen: 0, done: 0, checked: 0, nested: 0 };
     for (const el of allDirAuto) {
+      // Fast-path: skip elements fully evaluated in any previous scan.
+      // Avoids the expensive findPostContainer DOM walk for 10 000+ already-seen
+      // elements every 1.2 s.  New DOM nodes added by Facebook's infinite scroll
+      // are not in the WeakSet and will be processed normally.
+      if (_scanSeenElements.has(el)) { skipReasons.seen++; continue; }
+
       // Use textContent (not innerText) for the filter check.
       // innerText triggers a synchronous layout reflow on every call.
       // With 10000+ elements this causes Facebook's UI to freeze and
@@ -683,22 +804,22 @@
       // no layout, no reflow.  Per-post extraction still uses innerText.
       const text = el.textContent.trim();
       // Must have some real content (not just UI labels)
-      if (text.length < 8) { skipReasons.short++; continue; }
+      if (text.length < 8) { _scanSeenElements.add(el); skipReasons.short++; continue; }
       // Skip known UI patterns
-      if (/^(switch into|you're commenting|manage|boost this|write a comment)/i.test(text)) { skipReasons.ui++; continue; }
-      if (/^(like|comment|share|send|reply|follow|sponsored|facebook)$/i.test(text)) { skipReasons.ui++; continue; }
+      if (/^(switch into|you're commenting|manage|boost this|write a comment)/i.test(text)) { _scanSeenElements.add(el); skipReasons.ui++; continue; }
+      if (/^(like|comment|share|send|reply|follow|sponsored|facebook)$/i.test(text)) { _scanSeenElements.add(el); skipReasons.ui++; continue; }
 
       // Find the post container for this text element
       const container = findPostContainer(el);
-      if (!container) { skipReasons.noContainer++; continue; }
+      if (!container) { _scanSeenElements.add(el); skipReasons.noContainer++; continue; }
 
       // Skip if already processed this container in this scan
       if (seenContainers.has(container)) { skipReasons.seen++; continue; }
       seenContainers.add(container);
 
       // Skip if already scraped or already checked (rejected sidebar/non-post)
-      if (container.dataset.fbScraperDone) { skipReasons.done++; continue; }
-      if (container.dataset.fbScraperChecked) { skipReasons.checked++; continue; }
+      if (container.dataset.fbScraperDone) { _scanSeenElements.add(el); skipReasons.done++; continue; }
+      if (container.dataset.fbScraperChecked) { _scanSeenElements.add(el); skipReasons.checked++; continue; }
 
       // Skip if this container is inside an already-scraped post container
       // (prevents duplicate text-only captures from inner elements)
@@ -717,11 +838,13 @@
       }
       if (isNested) {
         container.dataset.fbScraperDone = 'true';
+        _scanSeenElements.add(el);
         skipReasons.nested++;
         continue;
       }
 
       found++;
+      _scanSeenElements.add(el);
       processPost(container);
     }
 
@@ -852,28 +975,87 @@
     }
   }
 
+  // Cheap permalink extraction — reads only href attributes, no innerText/layout reflows.
+  // Returns the raw href of the first permalink-shaped link found in the container.
+  function quickPermalink(container) {
+    const PATTERNS = ['/posts/', '/permalink/', 'story_fbid', '/photos/', '/photo/', '/videos/', '/reel/', 'pfbid'];
+    const links = container.querySelectorAll('a[href]');
+    for (const link of links) {
+      const href = link.getAttribute('href') || '';
+      if (PATTERNS.some(p => href.includes(p))) return href;
+    }
+    return '';
+  }
+
+  // Re-find a post container when the original has been detached by Facebook's
+  // virtualization. Searches the live DOM for an anchor matching the permalink path,
+  // then walks up to the enclosing post container.
+  function findContainerByPermalink(hrefOrUrl) {
+    if (!hrefOrUrl) return null;
+    let pathPart;
+    try {
+      // Handle both full URLs and relative paths ("/posts/123")
+      pathPart = new URL(hrefOrUrl, 'https://www.facebook.com').pathname;
+      if (!pathPart || pathPart === '/') return null;
+      const allLinks = document.querySelectorAll('a[href]');
+      for (const link of allLinks) {
+        if (!(link.getAttribute('href') || '').includes(pathPart)) continue;
+        let walker = link;
+        for (let i = 0; i < 15; i++) {
+          walker = walker.parentElement;
+          if (!walker || walker === document.body) { walker = null; break; }
+          if (walker.children.length >= 10 &&
+              walker.querySelector('div[dir="auto"], span[dir="auto"]') &&
+              !isNonPostContainer(walker)) {
+            return walker;
+          }
+        }
+      }
+    } catch {}
+    return null;
+  }
+
   function processPost(container) {
     if (!isActive) return;
     // Click "See more" to expand, then extract after delay
     const clicked = clickSeeMore(container);
     const delay = clicked ? 400 : 0;
 
+    // Pre-capture permalink href before the timeout using a cheap href-only scan
+    // (no innerText/layout reflows). If Facebook re-renders the post container
+    // during the expansion delay, we can re-find it by this href.
+    const prePermalink = quickPermalink(container);
+
     setTimeout(() => {
       // Guard: if scraping was stopped during the delay, abort
       if (!isActive) return;
 
-      // Guard: if the container was detached from the DOM (e.g. after sleep),
-      // skip extraction — the post will be re-discovered on the next scan
+      // Guard: if the container was detached from the DOM, try to re-find it by
+      // permalink. Facebook virtualizes the feed and may replace a DOM node
+      // during or after a "See more" click (re-rendering causes detachment).
+      let activeContainer = container;
       if (!document.contains(container)) {
-        console.log('[FB Scraper] Skipped detached container (DOM node removed, likely after sleep)');
-        return;
+        if (prePermalink) {
+          const refound = findContainerByPermalink(prePermalink);
+          if (refound) {
+            console.log('[FB Scraper] Re-found detached container via permalink:', prePermalink);
+            activeContainer = refound;
+            clickSeeMore(activeContainer);
+          } else {
+            console.log('[FB Scraper] Skipped detached container (permalink not found in DOM)');
+            return;
+          }
+        } else {
+          console.log('[FB Scraper] Skipped detached container (DOM node removed, no permalink)');
+          return;
+        }
       }
 
       // Click again in case expansion revealed more
-      if (clicked) clickSeeMore(container);
+      if (clicked) clickSeeMore(activeContainer);
 
-      let postText = extractPostText(container);
-      const author = extractAuthor(container);
+      let postText = extractPostText(activeContainer);
+      const author = extractAuthor(activeContainer);
 
       // Safeguard: trim extremely long posts to prevent performance issues
       const MAX_POST_LENGTH = 10000;
@@ -882,64 +1064,77 @@
         postText = '[attention: post text too long, content is trimmed] ' + postText.substring(0, MAX_POST_LENGTH);
       }
 
+      // Immediate innerText fallback: try while the container is still in/near the
+      // viewport — before Facebook virtualizes the DOM node off-screen (which strips
+      // body content from containers that have scrolled far up the page, making
+      // later retries see only the title). This handles posts where dir="auto"
+      // elements only hold a short title but the full body is in container.innerText.
+      if (postText.length >= 3 && postText.length < 50) {
+        const immediateText = extractPostTextFallback(activeContainer, author, postText);
+        if (immediateText.length > postText.length) {
+          console.log('[FB Scraper] Immediate fallback: ' + postText.length + ' -> ' + immediateText.length + ' | "' + author.substring(0, 25) + '"');
+          postText = immediateText;
+        }
+      }
+
       if (!postText && !author) {
         console.log('[FB Scraper] Skipped empty container');
-        container.dataset.fbScraperChecked = 'true';
+        activeContainer.dataset.fbScraperChecked = 'true';
         return;
       }
 
       // Skip non-post content (notifications panel, nav elements, etc.)
       if (/^(your push notifications|turn on notifications|not now|new see all|notifications\n)/i.test(postText)) {
         console.log('[FB Scraper] Skipped notifications panel');
-        container.dataset.fbScraperChecked = 'true';
+        activeContainer.dataset.fbScraperChecked = 'true';
         return;
       }
       if (/notifications?\s*(are\s+)?off/i.test(author)) {
         console.log('[FB Scraper] Skipped notification header:', author);
-        container.dataset.fbScraperChecked = 'true';
+        activeContainer.dataset.fbScraperChecked = 'true';
         return;
       }
       if ((postText.match(/\bUnread/gi) || []).length >= 3) {
         console.log('[FB Scraper] Skipped notification list (multiple Unread entries)');
-        container.dataset.fbScraperChecked = 'true';
+        activeContainer.dataset.fbScraperChecked = 'true';
         return;
       }
       if (/^(details|contact info|photos|intro|about|friends|videos|reels|check-ins|music|posts)$/i.test(author)) {
         console.log('[FB Scraper] Skipped sidebar section:', author);
-        container.dataset.fbScraperChecked = 'true';
+        activeContainer.dataset.fbScraperChecked = 'true';
         return;
       }
       if (/\d+[kK]?\s*likes?\s*[•·]\s*\d+[kK]?\s*followers?/i.test(postText)) {
         console.log('[FB Scraper] Skipped sidebar (likes/followers pattern)');
-        container.dataset.fbScraperChecked = 'true';
+        activeContainer.dataset.fbScraperChecked = 'true';
         return;
       }
       const lines = postText.split('\n').map(l => l.trim()).filter(l => l);
       const uniqueLines = new Set(lines);
       if (uniqueLines.size <= 2 && lines.length > 3) {
         console.log('[FB Scraper] Skipped repetitive content');
-        container.dataset.fbScraperChecked = 'true';
+        activeContainer.dataset.fbScraperChecked = 'true';
         return;
       }
 
       // Mark container as done so it's not re-processed.
-      if (container.children.length >= 8) {
-        container.dataset.fbScraperChecked = 'true';
+      if (activeContainer.children.length >= 8) {
+        activeContainer.dataset.fbScraperChecked = 'true';
       } else {
-        container.dataset.fbScraperDone = 'true';
+        activeContainer.dataset.fbScraperDone = 'true';
       }
 
-      const { timestamp, permalink } = extractTimestamp(container);
+      const { timestamp, permalink } = extractTimestamp(activeContainer);
 
       // Reject non-post content (notifications, footer, comment counts)
       const trimmedText = postText.trim();
-      if (/^Unread/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
-      if (/^\d+\s*comments?$/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
-      if (/^(· Privacy|Privacy\s+·\s+Terms)/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
-      if (/^\d+% recommend\b/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
-      if (/^Details\b/i.test(trimmedText) && /\b(recommend|contact info|privacy|terms)\b/i.test(trimmedText)) { container.dataset.fbScraperChecked = 'true'; return; }
-      if (/\b(added to (?:his|her|their) story)\b/i.test(trimmedText) && trimmedText.length < 100) { container.dataset.fbScraperChecked = 'true'; return; }
-      if (/\b(sent messages? to)\b/i.test(trimmedText) && trimmedText.length < 100) { container.dataset.fbScraperChecked = 'true'; return; }
+      if (/^Unread/i.test(trimmedText)) { activeContainer.dataset.fbScraperChecked = 'true'; return; }
+      if (/^\d+\s*comments?$/i.test(trimmedText)) { activeContainer.dataset.fbScraperChecked = 'true'; return; }
+      if (/^(· Privacy|Privacy\s+·\s+Terms)/i.test(trimmedText)) { activeContainer.dataset.fbScraperChecked = 'true'; return; }
+      if (/^\d+% recommend\b/i.test(trimmedText)) { activeContainer.dataset.fbScraperChecked = 'true'; return; }
+      if (/^Details\b/i.test(trimmedText) && /\b(recommend|contact info|privacy|terms)\b/i.test(trimmedText)) { activeContainer.dataset.fbScraperChecked = 'true'; return; }
+      if (/\b(added to (?:his|her|their) story)\b/i.test(trimmedText) && trimmedText.length < 100) { activeContainer.dataset.fbScraperChecked = 'true'; return; }
+      if (/\b(sent messages? to)\b/i.test(trimmedText) && trimmedText.length < 100) { activeContainer.dataset.fbScraperChecked = 'true'; return; }
 
       // Deduplicate by permalink — allow longer text to replace shorter
       let isReplacement = false;
@@ -948,7 +1143,29 @@
         const prevLen = processedPermalinks.get(permalink);
         if (postText.length <= prevLen) {
           console.log('[FB Scraper] Skipped permalink dup:', permalink, '| text:', postText.substring(0, 40) + '...', '| len:', postText.length, '<=', prevLen);
-          container.dataset.fbScraperDone = 'true';
+          // For short stored text, try innerText-based fallback before giving up.
+          // Photo post captions and some other posts don't put the full text in
+          // dir="auto" elements, so extractPostText misses the body.
+          if (prevLen >= 3 && prevLen < 50) {
+            const fallbackText = extractPostTextFallback(activeContainer, author, postText);
+            if (fallbackText.length > prevLen) {
+              console.log('[FB Scraper] DupSkip rescued via innerText: ' + prevLen + ' -> ' + fallbackText.length + ' chars | "' + author.substring(0, 25) + '"');
+              processedPermalinks.set(permalink, fallbackText.length);
+              const rescuedPost = {
+                author,
+                postText: fallbackText,
+                timestamp,
+                permalink,
+                reactions: extractReactions(activeContainer),
+                comments: extractComments(activeContainer),
+                images: extractImages(activeContainer),
+                videos: extractVideos(activeContainer),
+                scrapedAt: new Date().toISOString(),
+              };
+              chrome.runtime.sendMessage({ type: 'REPLACE_POST', post: rescuedPost }).catch(() => {});
+            }
+          }
+          activeContainer.dataset.fbScraperDone = 'true';
           return;
         }
         console.log('[FB Scraper] Replacing truncated capture (permalink) for', permalink,
@@ -964,7 +1181,30 @@
       if (existingPrefix && !isReplacement) {
         if (postText.length <= existingPrefix.textLength) {
           console.log('[FB Scraper] Skipped prefix dup:', author, '|', postText.substring(0, 40) + '...', '| len:', postText.length, '<=', existingPrefix.textLength);
-          container.dataset.fbScraperDone = 'true';
+          if (existingPrefix.textLength >= 3 && existingPrefix.textLength < 50) {
+            const fallbackText = extractPostTextFallback(activeContainer, author, postText);
+            if (fallbackText.length > existingPrefix.textLength) {
+              console.log('[FB Scraper] PrefixDup rescued via innerText: ' + existingPrefix.textLength + ' -> ' + fallbackText.length + ' | "' + author.substring(0, 25) + '"');
+              processedHashes.delete(existingPrefix.hash);
+              const newHash = hashString(author + fallbackText);
+              processedHashes.add(newHash);
+              processedPrefixes.set(prefixKey, { textLength: fallbackText.length, hash: newHash });
+              if (permalink) processedPermalinks.set(permalink, fallbackText.length);
+              const rescuedPost = {
+                author, postText: fallbackText, timestamp, permalink,
+                reactions: extractReactions(activeContainer),
+                comments: extractComments(activeContainer),
+                images: extractImages(activeContainer),
+                videos: extractVideos(activeContainer),
+                scrapedAt: new Date().toISOString(),
+              };
+              const rescueMsg = { type: 'REPLACE_POST', post: rescuedPost };
+              rescueMsg.matchPrefix = postText.substring(0, PREFIX_LEN);
+              rescueMsg.matchAuthor = author;
+              chrome.runtime.sendMessage(rescueMsg).catch(() => {});
+            }
+          }
+          activeContainer.dataset.fbScraperDone = 'true';
           return;
         }
         // New text is longer — replace the truncated capture
@@ -979,7 +1219,7 @@
       const key = hashString(author + postText);
       if (processedHashes.has(key)) {
         console.log('[FB Scraper] Skipped hash dup:', author, '|', postText.substring(0, 40) + '...', '| permalink:', permalink || 'none');
-        container.dataset.fbScraperDone = 'true';
+        activeContainer.dataset.fbScraperDone = 'true';
         return;
       }
       // For short captures (<200 chars) where a permalink is known, skip the hash
@@ -994,10 +1234,10 @@
       }
       if (permalink) processedPermalinks.set(permalink, postText.length);
 
-      const reactions = extractReactions(container);
-      const comments = extractComments(container);
-      const images = extractImages(container);
-      const videos = extractVideos(container);
+      const reactions = extractReactions(activeContainer);
+      const comments = extractComments(activeContainer);
+      const images = extractImages(activeContainer);
+      const videos = extractVideos(activeContainer);
 
       const post = {
         author,
@@ -1019,46 +1259,165 @@
       chrome.runtime.sendMessage(msg);
       console.log('[FB Scraper] Captured:', author, '|', postText.substring(0, 40) + '...');
 
-      // If text is short, try expanding asynchronously and replacing
-      if (postText.length < 200 && !isReplacement) {
+      // If See More was clicked, retry after 2000ms to catch expansions that
+      // need more time (e.g. Facebook XHR-fetches the full text on busy networks).
+      // Jitter (0–400ms) spreads concurrent retries across time to prevent
+      // layout-reflow bursts that freeze the UI when many posts are processed.
+      if (clicked && !isReplacement) {
         const retryPrefixKey = prefixKey;
+        const jitter = Math.floor(Math.random() * 400);
         setTimeout(() => {
-          if (!document.contains(container)) {
-            console.log('[FB Scraper] Retry: container detached, skipping re-expand');
+          // Re-find the container if detached (Facebook re-rendering)
+          let retryContainer = activeContainer;
+          const attached = document.contains(retryContainer);
+          if (!attached) {
+            const retryPermalink = permalink || prePermalink;
+            if (retryPermalink) {
+              const refound = findContainerByPermalink(retryPermalink);
+              if (refound) {
+                retryContainer = refound;
+              } else {
+                console.log('[FB Scraper] RetryA: DETACHED+LOST | no refound in DOM | initial=' + postText.length + ' | "' + author.substring(0, 25) + '"');
+                return;
+              }
+            } else {
+              console.log('[FB Scraper] RetryA: DETACHED+NOPERMALINK | initial=' + postText.length + ' | "' + author.substring(0, 25) + '"');
+              return;
+            }
+          }
+
+          // Read current text WITHOUT clicking first. If expansion already completed
+          // during the wait, send replacement immediately with no DOM mutation.
+          let retryText = extractPostText(retryContainer);
+          if (retryText.length > MAX_POST_LENGTH) {
+            retryText = '[attention: post text too long, content is trimmed] ' + retryText.substring(0, MAX_POST_LENGTH);
+          }
+          console.log('[FB Scraper] RetryA: attached=' + attached + ' | initial=' + postText.length + ' | now=' + retryText.length + ' | "' + author.substring(0, 25) + '"');
+          if (retryText.length > postText.length) {
+            const retryPost = { ...post, postText: retryText, scrapedAt: new Date().toISOString() };
+            if (permalink) processedPermalinks.set(permalink, retryText.length);
+            const retryHash = hashString(author + retryText);
+            processedHashes.add(retryHash);
+            processedPrefixes.set(retryPrefixKey, { textLength: retryText.length, hash: retryHash });
+            const retryMsg = { type: 'REPLACE_POST', post: retryPost };
+            if (!permalink) {
+              retryMsg.matchPrefix = postText.substring(0, PREFIX_LEN);
+              retryMsg.matchAuthor = author;
+            }
+            chrome.runtime.sendMessage(retryMsg);
             return;
           }
-          const retryClicked = clickSeeMore(container);
-          if (retryClicked) {
-            console.log('[FB Scraper] Retry: clicked See more for', author, '|', postText.substring(0, 30));
-          }
-          // Always re-extract: if See more was already clicked in the first pass,
-          // the expansion may not have finished within the initial 400ms delay.
-          // By the time this retry runs (1000ms later), the text is fully expanded.
-          // Use 500ms delay only if we just clicked; 0ms if already expanded.
-          const retryDelay = retryClicked ? 500 : 0;
-          setTimeout(() => {
-            if (!document.contains(container)) return;
-            let retryText = extractPostText(container);
-            if (retryText.length > MAX_POST_LENGTH) {
-              console.warn('[FB Scraper] Retry text extremely long (' + retryText.length + ' chars), trimming to ' + MAX_POST_LENGTH);
-              retryText = '[attention: post text too long, content is trimmed] ' + retryText.substring(0, MAX_POST_LENGTH);
-            }
-            if (retryText.length > postText.length) {
-              console.log('[FB Scraper] Retry: expanded', postText.length, '->', retryText.length, 'chars');
-              const retryPost = { ...post, postText: retryText, scrapedAt: new Date().toISOString() };
-              if (permalink) processedPermalinks.set(permalink, retryText.length);
-              const retryHash = hashString(author + retryText);
+
+          // Text unchanged via dir="auto" — try innerText fallback first.
+          // Catches posts whose caption is not in dir="auto" after expansion.
+          // Guard: postText.length >= 3 excludes photo-only posts (empty text).
+          // Also check the currently stored length: DupSkip may have already rescued
+          // this post with a longer result, so only fire if we can beat what's stored.
+          const storedLen = (permalink && processedPermalinks.get(permalink)) || postText.length;
+          if (postText.length >= 3 && postText.length < 50) {
+            const fallbackText = extractPostTextFallback(retryContainer, author, postText);
+            if (fallbackText.length > postText.length && fallbackText.length > storedLen) {
+              console.log('[FB Scraper] RetryA fallback rescued: ' + postText.length + ' -> ' + fallbackText.length + ' | "' + author.substring(0, 25) + '"');
+              const retryPost = { ...post, postText: fallbackText, scrapedAt: new Date().toISOString() };
+              if (permalink) processedPermalinks.set(permalink, fallbackText.length);
+              const retryHash = hashString(author + fallbackText);
               processedHashes.add(retryHash);
-              processedPrefixes.set(retryPrefixKey, { textLength: retryText.length, hash: retryHash });
+              processedPrefixes.set(retryPrefixKey, { textLength: fallbackText.length, hash: retryHash });
+              const retryMsg = { type: 'REPLACE_POST', post: retryPost };
+              if (!permalink) { retryMsg.matchPrefix = postText.substring(0, PREFIX_LEN); retryMsg.matchAuthor = author; }
+              chrome.runtime.sendMessage(retryMsg);
+              return;
+            }
+          }
+
+          // Text still unchanged — try clicking See More again (succeeds if this is a
+          // refound fresh container that hasn't been clicked yet).
+          const retryClicked = clickSeeMore(retryContainer);
+          console.log('[FB Scraper] RetryA: button=' + retryClicked + ' | waiting for expansion | "' + author.substring(0, 25) + '"');
+
+          // Wait for expansion: longer if no button (XHR may still be completing).
+          const secondWait = retryClicked ? 1200 : 1500;
+          setTimeout(() => {
+            // Refind if detached during second wait
+            let retryContainer2 = retryContainer;
+            if (!document.contains(retryContainer2)) {
+              const retryPermalink2 = permalink || prePermalink;
+              if (retryPermalink2) {
+                const refound2 = findContainerByPermalink(retryPermalink2);
+                if (refound2) retryContainer2 = refound2;
+                else {
+                  console.log('[FB Scraper] RetryB: DETACHED+LOST | initial=' + postText.length + ' | "' + author.substring(0, 25) + '"');
+                  return;
+                }
+              } else {
+                console.log('[FB Scraper] RetryB: DETACHED+NOPERMALINK | initial=' + postText.length + ' | "' + author.substring(0, 25) + '"');
+                return;
+              }
+            }
+            let retryText2 = extractPostText(retryContainer2);
+            if (retryText2.length > MAX_POST_LENGTH) {
+              retryText2 = '[attention: post text too long, content is trimmed] ' + retryText2.substring(0, MAX_POST_LENGTH);
+            }
+            console.log('[FB Scraper] RetryB: initial=' + postText.length + ' | final=' + retryText2.length + ' | ' + (retryText2.length > postText.length ? 'FIXED' : 'still-waiting') + ' | "' + author.substring(0, 25) + '"');
+            if (retryText2.length > postText.length) {
+              const retryPost = { ...post, postText: retryText2, scrapedAt: new Date().toISOString() };
+              if (permalink) processedPermalinks.set(permalink, retryText2.length);
+              const retryHash = hashString(author + retryText2);
+              processedHashes.add(retryHash);
+              processedPrefixes.set(retryPrefixKey, { textLength: retryText2.length, hash: retryHash });
               const retryMsg = { type: 'REPLACE_POST', post: retryPost };
               if (!permalink) {
                 retryMsg.matchPrefix = postText.substring(0, PREFIX_LEN);
                 retryMsg.matchAuthor = author;
               }
               chrome.runtime.sendMessage(retryMsg);
+            } else {
+              // Expansion still not complete — RetryA clicked a freshly re-rendered button
+              // and the XHR is still in flight. Wait 3s more and read one final time.
+              setTimeout(() => {
+                let retryContainer3 = retryContainer2;
+                if (!document.contains(retryContainer3)) {
+                  const rp3 = permalink || prePermalink;
+                  if (rp3) {
+                    const r3 = findContainerByPermalink(rp3);
+                    if (r3) retryContainer3 = r3; else return;
+                  } else return;
+                }
+                let retryText3 = extractPostText(retryContainer3);
+                if (retryText3.length > MAX_POST_LENGTH) {
+                  retryText3 = '[attention: post text too long, content is trimmed] ' + retryText3.substring(0, MAX_POST_LENGTH);
+                }
+                console.log('[FB Scraper] RetryC: initial=' + postText.length + ' | final=' + retryText3.length + ' | ' + (retryText3.length > postText.length ? 'FIXED' : 'GAVE_UP') + ' | "' + author.substring(0, 25) + '"');
+                if (retryText3.length <= postText.length) {
+                  // Diagnostic: find all elements in container with substantial text to identify which element type holds expanded text
+                  const allEls = retryContainer3.querySelectorAll('*');
+                  const suspects = [];
+                  for (const el of allEls) {
+                    if (el.children.length > 0) continue; // leaf nodes only
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t.length > 40) {
+                      suspects.push(el.tagName.toLowerCase() + '[dir=' + (el.getAttribute('dir') || 'none') + '] len=' + t.length + ' :: ' + t.substring(0, 80));
+                    }
+                  }
+                  console.log('[FB Scraper] RetryC DOM suspects (' + suspects.length + '):\n' + suspects.slice(0, 10).join('\n'));
+                }
+                if (retryText3.length > postText.length) {
+                  const retryPost = { ...post, postText: retryText3, scrapedAt: new Date().toISOString() };
+                  if (permalink) processedPermalinks.set(permalink, retryText3.length);
+                  const retryHash = hashString(author + retryText3);
+                  processedHashes.add(retryHash);
+                  processedPrefixes.set(retryPrefixKey, { textLength: retryText3.length, hash: retryHash });
+                  const retryMsg = { type: 'REPLACE_POST', post: retryPost };
+                  if (!permalink) {
+                    retryMsg.matchPrefix = postText.substring(0, PREFIX_LEN);
+                    retryMsg.matchAuthor = author;
+                  }
+                  chrome.runtime.sendMessage(retryMsg);
+                }
+              }, 3000);
             }
-          }, retryDelay);
-        }, 1000);
+          }, secondWait);
+        }, 2000 + jitter);
       }
     }, delay);
   }
@@ -1234,9 +1593,10 @@
       }
 
       // Debounce: don't scan on every tiny mutation.
-      // After 150+ posts the DOM is large so use a longer debounce to
-      // batch mutations and avoid firing expensive scans too frequently.
-      const debounceMs = processedHashes.size > 150 ? 800 : 300;
+      // Scale up with post count — larger DOM means more mutations and
+      // more expensive scans (even with the WeakSet, the querySelectorAll
+      // itself grows with the page).
+      const debounceMs = processedHashes.size > 300 ? 1500 : processedHashes.size > 150 ? 800 : 300;
       clearTimeout(observer._debounce);
       observer._debounce = setTimeout(scanForPosts, debounceMs);
     });
