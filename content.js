@@ -812,6 +812,8 @@
       if (src.includes('/p50x50/') || src.includes('/p40x40/') || src.includes('/p36x36/')) continue;
       // Skip link preview proxy images (not directly downloadable)
       if (src.includes('safe_image.php') || src.includes('/external')) continue;
+      // Skip video thumbnails (t15.5256 CDN path) — these are captured by extractVideos instead
+      if (src.includes('t15.5256')) continue;
       // Keep scontent images (actual post photos/images)
       if (src.includes('scontent') || src.includes('fbcdn.net')) {
         if (!seen.has(src)) {
@@ -828,7 +830,8 @@
     const urls = [];
     const seen = new Set();
 
-    // 1. Check for <video> elements with direct src
+    // 1. Check for <video> elements — capture poster URL for inline videos (MSE/blob playback
+    //    means no downloadable src is available; poster is the only stable DOM reference)
     const videos = container.querySelectorAll('video');
     for (const video of videos) {
       const src = video.getAttribute('src') || '';
@@ -845,6 +848,13 @@
           urls.push(ssrc);
         }
       }
+      // Capture poster attribute (video thumbnail) — Facebook inline videos use MSE/blob so
+      // there is no direct video URL in the DOM; the poster is the only stable reference.
+      const poster = video.getAttribute('poster') || '';
+      if (poster && !poster.startsWith('data:') && !seen.has(poster)) {
+        seen.add(poster);
+        urls.push(poster);
+      }
     }
 
     // 2. Check for links to Facebook video pages (/videos/, /reel/, /watch?v=)
@@ -858,7 +868,15 @@
       ) {
         try {
           const url = new URL(link.href, 'https://www.facebook.com');
-          url.search = '';
+          // For /watch?v= URLs, preserve the v= parameter (it IS the video identifier)
+          // Only strip tracking params (__cft__, __tn__, etc.)
+          if (href.includes('/watch') && href.includes('v=')) {
+            const v = url.searchParams.get('v');
+            url.search = '';
+            if (v) url.searchParams.set('v', v);
+          } else {
+            url.search = '';
+          }
           const clean = url.toString();
           if (!seen.has(clean)) {
             seen.add(clean);

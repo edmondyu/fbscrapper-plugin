@@ -506,10 +506,104 @@ function makeFindPostContainer() {
   };
 }
 
+function makeExtractImages() {
+  function extractImages(container) {
+    const imgs = container.querySelectorAll('img');
+    const urls = [];
+    const seen = new Set();
+    for (const img of imgs) {
+      const src = img.src || img.getAttribute('src') || '';
+      if (!src) continue;
+      const w = img.naturalWidth || img.width || 0;
+      const h = img.naturalHeight || img.height || 0;
+      if (w > 0 && w < 50 && h > 0 && h < 50) continue;
+      if (src.startsWith('data:')) continue;
+      if (src.includes('/emoji') || src.includes('/reaction')) continue;
+      if (src.includes('/p50x50/') || src.includes('/p40x40/') || src.includes('/p36x36/')) continue;
+      if (src.includes('safe_image.php') || src.includes('/external')) continue;
+      // Skip video thumbnails (t15.5256 CDN path) — captured by extractVideos instead
+      if (src.includes('t15.5256')) continue;
+      if (src.includes('scontent') || src.includes('fbcdn.net')) {
+        if (!seen.has(src)) {
+          seen.add(src);
+          urls.push(src);
+        }
+      }
+    }
+    return urls;
+  }
+  return { extractImages };
+}
+
+function makeExtractVideos() {
+  function extractVideos(container) {
+    const urls = [];
+    const seen = new Set();
+
+    const videos = container.querySelectorAll('video');
+    for (const video of videos) {
+      const src = video.getAttribute('src') || '';
+      if (src && !src.startsWith('data:') && !src.startsWith('blob:') && !seen.has(src)) {
+        seen.add(src);
+        urls.push(src);
+      }
+      const sources = video.querySelectorAll('source');
+      for (const source of sources) {
+        const ssrc = source.getAttribute('src') || '';
+        if (ssrc && !ssrc.startsWith('data:') && !ssrc.startsWith('blob:') && !seen.has(ssrc)) {
+          seen.add(ssrc);
+          urls.push(ssrc);
+        }
+      }
+      // Capture poster attribute for inline MSE/blob videos (no direct src available)
+      const poster = video.getAttribute('poster') || '';
+      if (poster && !poster.startsWith('data:') && !seen.has(poster)) {
+        seen.add(poster);
+        urls.push(poster);
+      }
+    }
+
+    const links = container.querySelectorAll('a[href]');
+    for (const link of links) {
+      const href = link.getAttribute('href') || '';
+      if (
+        href.includes('/videos/') ||
+        href.includes('/reel/') ||
+        (href.includes('/watch') && href.includes('v='))
+      ) {
+        try {
+          const url = new URL(href, 'https://www.facebook.com');
+          if (href.includes('/watch') && href.includes('v=')) {
+            const v = url.searchParams.get('v');
+            url.search = '';
+            if (v) url.searchParams.set('v', v);
+          } else {
+            url.search = '';
+          }
+          const clean = url.toString();
+          if (!seen.has(clean)) {
+            seen.add(clean);
+            urls.push(clean);
+          }
+        } catch {
+          if (!seen.has(href)) {
+            seen.add(href);
+            urls.push(href);
+          }
+        }
+      }
+    }
+    return urls;
+  }
+  return { extractVideos };
+}
+
 module.exports = {
   makeExtractTimestamp,
   makeExtractAuthor,
   makeExtractPostText,
   makeExtractPostTextFallback,
   makeFindPostContainer,
+  makeExtractImages,
+  makeExtractVideos,
 };

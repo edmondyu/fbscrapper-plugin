@@ -9,6 +9,8 @@ const {
   makeExtractPostText,
   makeExtractPostTextFallback,
   makeFindPostContainer,
+  makeExtractImages,
+  makeExtractVideos,
 } = require('./scraper-utils');
 
 // ─── Minimal test framework ────────────────────────────────────────────────────
@@ -655,6 +657,125 @@ console.log('\n── Fixture: older post with date-only timestamp ────�
     );
   } catch (e) {
     assert('fixture older-post: loaded without error', false, e.message);
+  }
+}
+
+// ─── Image extraction ─────────────────────────────────────────────────────────
+
+console.log('\n── Image extraction ──');
+{
+  const { extractImages } = makeExtractImages();
+
+  // Regular photo URL is kept
+  {
+    const dom = new JSDOM(`<div>
+      <img src="https://scontent-man2-1.xx.fbcdn.net/v/t31.0-8/photo.jpg" width="640" height="480">
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractImages(container);
+    assert('extractImages: regular scontent photo captured', urls.length === 1, `got: ${JSON.stringify(urls)}`);
+    assert('extractImages: correct URL returned', urls[0].includes('t31.0-8'), `got: ${urls[0]}`);
+  }
+
+  // Video thumbnail (t15.5256) is excluded
+  {
+    const dom = new JSDOM(`<div>
+      <img src="https://scontent-man2-1.xx.fbcdn.net/v/t15.5256-10/thumb.jpg" width="640" height="360">
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractImages(container);
+    assert('extractImages: t15.5256 video thumbnail excluded', urls.length === 0, `got: ${JSON.stringify(urls)}`);
+  }
+
+  // Small icons skipped (when width/height attributes set)
+  {
+    const dom = new JSDOM(`<div>
+      <img src="https://scontent-man2-1.xx.fbcdn.net/v/t31.0-8/icon.png" width="20" height="20">
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractImages(container);
+    assert('extractImages: small icon (20x20) excluded', urls.length === 0, `got: ${JSON.stringify(urls)}`);
+  }
+
+  // Non-fbcdn URLs are ignored
+  {
+    const dom = new JSDOM(`<div>
+      <img src="https://example.com/image.jpg" width="640" height="480">
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractImages(container);
+    assert('extractImages: non-fbcdn URL excluded', urls.length === 0, `got: ${JSON.stringify(urls)}`);
+  }
+}
+
+// ─── Video extraction ──────────────────────────────────────────────────────────
+
+console.log('\n── Video extraction ──');
+{
+  const { extractVideos } = makeExtractVideos();
+
+  // Inline video with poster (Facebook native video — no src, MSE/blob playback)
+  {
+    const dom = new JSDOM(`<div>
+      <video playsinline poster="https://scontent-man2-1.xx.fbcdn.net/v/t15.5256-10/thumb.jpg"></video>
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractVideos(container);
+    assert('extractVideos: poster URL captured from <video> element', urls.length === 1, `got: ${JSON.stringify(urls)}`);
+    assert('extractVideos: poster URL is the t15.5256 thumbnail', urls[0].includes('t15.5256'), `got: ${urls[0]}`);
+  }
+
+  // blob: src is excluded (ephemeral MSE URL)
+  {
+    const dom = new JSDOM(`<div>
+      <video src="blob:https://www.facebook.com/abc123" poster="https://scontent.fbcdn.net/v/t15.5256-10/thumb.jpg"></video>
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractVideos(container);
+    // blob src excluded; poster still captured
+    assert('extractVideos: blob src excluded, poster still captured', urls.length === 1, `got: ${JSON.stringify(urls)}`);
+  }
+
+  // /videos/ link — search params stripped
+  {
+    const dom = new JSDOM(`<div>
+      <a href="https://www.facebook.com/lammiuyan/videos/123456789/?__cft__=tracking">Watch</a>
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractVideos(container);
+    assert('extractVideos: /videos/ link captured', urls.length === 1, `got: ${JSON.stringify(urls)}`);
+    assert('extractVideos: /videos/ tracking params stripped', !urls[0].includes('__cft__'), `got: ${urls[0]}`);
+  }
+
+  // /watch?v= link — v= preserved, tracking stripped
+  {
+    const dom = new JSDOM(`<div>
+      <a href="https://www.facebook.com/watch/?v=1234567890123456&__cft__=tracking&ref=notif">Watch</a>
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractVideos(container);
+    assert('extractVideos: /watch?v= link captured', urls.length === 1, `got: ${JSON.stringify(urls)}`);
+    assert('extractVideos: /watch?v= v= param preserved', urls[0].includes('v=1234567890123456'), `got: ${urls[0]}`);
+    assert('extractVideos: /watch?v= tracking params stripped', !urls[0].includes('__cft__'), `got: ${urls[0]}`);
+  }
+
+  // No video elements and no links → empty
+  {
+    const dom = new JSDOM(`<div><p>Just text</p></div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractVideos(container);
+    assert('extractVideos: empty container returns []', urls.length === 0, `got: ${JSON.stringify(urls)}`);
+  }
+
+  // Dedup: same poster not added twice
+  {
+    const dom = new JSDOM(`<div>
+      <video poster="https://scontent.fbcdn.net/v/t15.5256-10/thumb.jpg"></video>
+      <video poster="https://scontent.fbcdn.net/v/t15.5256-10/thumb.jpg"></video>
+    </div>`);
+    const container = dom.window.document.querySelector('div');
+    const urls = extractVideos(container);
+    assert('extractVideos: duplicate poster deduplicated', urls.length === 1, `got: ${JSON.stringify(urls)}`);
   }
 }
 
