@@ -150,6 +150,22 @@ function getDownloadProgress(downloadQueue) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'UPDATE_TIMESTAMP') {
+    // Update the timestamp of a stored post when a better (full datetime) value
+    // arrives after the post was already saved with a date-only timestamp.
+    chrome.storage.local.get({ posts: [] }, (result) => {
+      const posts = result.posts;
+      const idx = posts.findIndex(p => p.permalink && p.permalink === msg.permalink);
+      if (idx !== -1 && posts[idx].timestamp === msg.oldTimestamp) {
+        posts[idx].timestamp = msg.newTimestamp;
+        chrome.storage.local.set({ posts }, () => sendResponse({ ok: true }));
+      } else {
+        sendResponse({ ok: false });
+      }
+    });
+    return true;
+  }
+
   if (msg.type === 'NEW_POST') {
     new Promise((resolve) => {
       postQueue.push({ post: msg.post, resolve });

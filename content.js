@@ -21,8 +21,45 @@
   // (a DOM-tree walk) for thousands of already-processed elements every 1.2s.
   // WeakSet holds references weakly so GC'd (Facebook-removed) nodes are freed.
   const _scanSeenElements = new WeakSet();
+  // Map from date key ("16 February") to sorted array of unix timestamps (newest first)
+  // populated by intercepting Facebook's GraphQL feed responses.
+  const _creationTimesByDate = new Map();
   const SCAN_INTERVAL = 1200;
   const SCROLL_INTERVAL = 1500;
+
+  // Posts that were saved with a date-only timestamp and need a retry once
+  // creation_time data arrives from the GraphQL response.
+  // Map: permalink -> rawDate (e.g. "16 February")
+  const _pendingTimestampPosts = new Map();
+
+  // Listen for creation_time batches posted by the main-world interceptor.
+  window.addEventListener('message', function(e) {
+    if (e.source !== window || !e.data || e.data.type !== 'FB_SCRAPER_CREATION_TIMES') return;
+    const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    for (const ts of e.data.times) {
+      const d = new Date(ts * 1000);
+      const key = d.getDate() + ' ' + MONTHS[d.getMonth()];
+      if (!_creationTimesByDate.has(key)) _creationTimesByDate.set(key, []);
+      _creationTimesByDate.get(key).push(ts);
+    }
+    // Keep each date bucket sorted newest-first so lookups consume in feed order
+    for (const [, arr] of _creationTimesByDate) arr.sort((a, b) => b - a);
+    // Retry any posts that were stored with a date-only timestamp
+    if (_pendingTimestampPosts.size > 0) {
+      for (const [permalink, rawDate] of Array.from(_pendingTimestampPosts)) {
+        const full = lookupCreationTime(rawDate);
+        if (full) {
+          _pendingTimestampPosts.delete(permalink);
+          chrome.runtime.sendMessage({
+            type: 'UPDATE_TIMESTAMP',
+            permalink,
+            oldTimestamp: rawDate,
+            newTimestamp: full
+          });
+        }
+      }
+    }
+  });
 
   // Detect the logged-in user's display name from Facebook's UI
   function detectLoggedInUser() {
@@ -508,7 +545,7 @@
   // Extract timestamp and permalink from a post container
   function extractTimestamp(container) {
     // Patterns that look like a timestamp
-    const TIME_PATTERN = /^(\d+\s*(h|hr|m|min|s|d|w|yr|mo|小時|分鐘|秒|天|週)$|just now|yesterday|today|\d{1,2}\s+(january|february|march|april|may|june|july|august|september|october|november|december)|[a-z]+ \d{1,2}(,?\s*\d{4})?(\s+at\s+\d|$))/i;
+    const TIME_PATTERN = /^(\d+\s*(h|hr|m|min|s|d|w|yr|mo|小時|分鐘|秒|天|週)$|just now|yesterday|today|\d+\s+(second|minute|hour|day|week|month|year)s?\s+ago|about\s+(a|an|\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago|\d{1,2}\s+(january|february|march|april|may|june|july|august|september|october|november|december)|[a-z]+ \d{1,2}(,?\s*\d{4})?(\s+at\s+\d|$))/i;
 
     // Chinese date formats: "1月5日", "2023年12月23日", "12月23日 上午10:30"
     const CHINESE_DATE = /^\d{1,2}月\d{1,2}日|^\d{4}年\d{1,2}月/;
@@ -549,6 +586,10 @@
       }
     }
 
+    function isRelativeTimestamp(ts) {
+      return /^\d+\s*(h|hr|m|min|s|d|w|yr|mo|小時|分鐘|秒|天|週)$|^just now$|^yesterday$|^today$|\d+\s+(second|minute|hour|day|week|month|year)s?\s+ago|^about\s+(a|an|\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$/i.test(ts);
+    }
+
     function isTimestampText(text) {
       if (!text || text.length > 30) return false;
       // Reject obvious non-timestamps
@@ -563,12 +604,31 @@
 
     // Extract timestamp from a link element — checks text, aria-label, nested spans, use-sibling text
     function getTimestampFromLink(link) {
+      // Check aria-labelledby — FB uses this for scrambled timestamps.
+      // A child span carries aria-labelledby pointing to a hidden <span id="...">
+      // that holds the plain-English label (e.g. "2 days ago", "about an hour ago",
+      // or an absolute date for older posts). Return immediately if absolute; save
+      // relative and keep looking so the CSS unscrambling can find the full date.
+      let ariaLabelledByFallback = '';
+      for (const el of link.querySelectorAll('[aria-labelledby]')) {
+        const labelId = el.getAttribute('aria-labelledby');
+        const labelEl = labelId && document.getElementById(labelId);
+        if (labelEl) {
+          const label = labelEl.textContent.trim();
+          if (isTimestampText(label)) {
+            if (!isRelativeTimestamp(label)) return label;
+            if (!ariaLabelledByFallback) ariaLabelledByFallback = label;
+          }
+        }
+      }
+      // Check aria-label — Facebook stores the full absolute date here
+      // (e.g. "March 8, 2025 at 2:30 PM") while visible text shows only the
+      // short relative form ("1w", "2w") which is less informative.
+      const ariaLabel = link.getAttribute('aria-label') || '';
+      if (isTimestampText(ariaLabel)) return ariaLabel;
       // Check direct text
       const text = link.innerText.trim();
       if (isTimestampText(text)) return text;
-      // Check aria-label
-      const ariaLabel = link.getAttribute('aria-label') || '';
-      if (isTimestampText(ariaLabel)) return ariaLabel;
       // Check nested spans
       for (const span of link.querySelectorAll('span, b')) {
         const spanText = span.innerText.trim();
@@ -594,18 +654,74 @@
           }
         }
       }
-      return '';
+      // CSS flex visual-position unscrambling for character-obfuscated links.
+      // Facebook scrambles timestamp text by placing each character in its own
+      // <span> inside a display:flex container. The visual order is set by CSS
+      // class rules (which property varies: `order`, `margin-left`, `transform`,
+      // etc.). Dummy/invisible characters are injected and hidden via display:none
+      // or visibility:hidden.
+      //
+      // getBoundingClientRect().left gives the actual rendered left position —
+      // works regardless of which CSS property Facebook uses for ordering. Falls
+      // back to getComputedStyle().order when off-screen (rect.left = 0 for all).
+      {
+        const leafChars = [];
+        for (const child of link.querySelectorAll('span')) {
+          if (child.children.length > 0) continue; // leaf only
+          const t = child.textContent;
+          if (!t) continue; // skip null/empty; allow whitespace (may be date separator)
+          const cs = window.getComputedStyle(child);
+          if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+          const order = parseInt(cs.order) || 0;
+          const rect = child.getBoundingClientRect();
+          const left = rect.left;
+          const top = rect.top;
+          leafChars.push({ text: t, order, left, top });
+        }
+        if (leafChars.length > 0) {
+          // Sort by top row first, then left within each row, then CSS order as tiebreaker.
+          // This handles all FB flex layouts:
+          //   row-flex: same top, different lefts → left gives reading order
+          //   column-flex: same left, different tops → top gives reading order
+          //   hybrid: real chars at one top row + noise chars at another → top separates them
+          leafChars.sort((a, b) => {
+            const td = a.top - b.top;
+            if (td !== 0) return td;
+            const ld = a.left - b.left;
+            return ld !== 0 ? ld : a.order - b.order;
+          });
+          const unscrambled = leafChars.map(c => c.text).join('').trim();
+          if (unscrambled && isTimestampText(unscrambled)) return unscrambled;
+          // The sorted string may have real date at the front with noise chars appended.
+          // Try to extract a leading date substring.
+          const tsPrefix = unscrambled.match(/^\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+at\s+\d{1,2}:\d{2})?/i)
+            || unscrambled.match(/^(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:,\s*\d{4})?(?:\s+at\s+\d{1,2}:\d{2}(?:\s*[AP]M)?)?/i);
+          if (tsPrefix) return tsPrefix[0];
+        }
+      }
+      return ariaLabelledByFallback;
     }
 
     const links = container.querySelectorAll('a[href]');
 
-    // Strategy 1: Permalink link with timestamp
+    // Strategy 1: Permalink link with timestamp.
+    // If the timestamp is only a short relative form ("2d", "4w", etc.), scan ALL
+    // links for an absolute date — Facebook often puts the flex-obfuscated absolute
+    // date on a non-permalink link (e.g. href="?__cft__...") that precedes the
+    // plain-text relative link in the DOM.
     for (const link of links) {
       const href = link.getAttribute('href') || '';
-      if (isPermalinkHref(href)) {
-        const ts = getTimestampFromLink(link);
-        if (ts) return { timestamp: ts, permalink: cleanPermalink(link) };
+      if (!isPermalinkHref(href)) continue;
+      const ts = getTimestampFromLink(link);
+      if (!ts) continue;
+      const permalink = cleanPermalink(link);
+      if (!isRelativeTimestamp(ts)) return { timestamp: ts, permalink };
+      // Relative timestamp found — scan all links for a better absolute date.
+      for (const l of links) {
+        const lts = getTimestampFromLink(l);
+        if (lts && !isRelativeTimestamp(lts)) return { timestamp: lts, permalink };
       }
+      return { timestamp: ts, permalink };
     }
 
     // Strategy 2: Any link whose text looks like a timestamp
@@ -1015,6 +1131,31 @@
     return null;
   }
 
+  // Format a unix timestamp as "D Month YYYY at HH:MM" (local time).
+  function formatCreationTime(unixTs) {
+    const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const d = new Date(unixTs * 1000);
+    return d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear() + ' at ' +
+      String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+
+  // Look up the full datetime for a date-only timestamp string (e.g. "16 February").
+  // Consumes the matching entry so each lookup returns a distinct post time.
+  function lookupCreationTime(dateOnlyStr) {
+    const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const m = dateOnlyStr.match(/(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)/i);
+    if (!m) return '';
+    const day = parseInt(m[1], 10);
+    const monthName = m[2].charAt(0).toUpperCase() + m[2].slice(1).toLowerCase();
+    const key = day + ' ' + monthName;
+    const bucket = _creationTimesByDate.get(key);
+    if (!bucket || bucket.length === 0) return '';
+    // Consume the newest-first entry (feeds are newest-first as we scroll down)
+    const ts = bucket.shift();
+    if (bucket.length === 0) _creationTimesByDate.delete(key);
+    return formatCreationTime(ts);
+  }
+
   function processPost(container) {
     if (!isActive) return;
     // Click "See more" to expand, then extract after delay
@@ -1124,7 +1265,15 @@
         activeContainer.dataset.fbScraperDone = 'true';
       }
 
-      const { timestamp, permalink } = extractTimestamp(activeContainer);
+      const { timestamp: rawTimestamp, permalink } = extractTimestamp(activeContainer);
+      // If only a date was captured (no time), look up the full datetime from
+      // creation_time unix timestamps intercepted from Facebook's GraphQL responses.
+      let timestamp = rawTimestamp;
+      if (rawTimestamp && !/\bat\b/i.test(rawTimestamp) &&
+          /\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)/i.test(rawTimestamp)) {
+        const full = lookupCreationTime(rawTimestamp);
+        if (full) timestamp = full;
+      }
 
       // Reject non-post content (notifications, footer, comment counts)
       const trimmedText = postText.trim();
@@ -1258,6 +1407,13 @@
       }
       chrome.runtime.sendMessage(msg);
       console.log('[FB Scraper] Captured:', author, '|', postText.substring(0, 40) + '...');
+      // If the timestamp is still date-only (creation_time not yet received), register
+      // the post for a retry update when the GraphQL response arrives.
+      if (timestamp === rawTimestamp && rawTimestamp && !/\bat\b/i.test(rawTimestamp) &&
+          /\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)/i.test(rawTimestamp) &&
+          permalink) {
+        _pendingTimestampPosts.set(permalink, rawTimestamp);
+      }
 
       // If See More was clicked, retry after 2000ms to catch expansions that
       // need more time (e.g. Facebook XHR-fetches the full text on busy networks).

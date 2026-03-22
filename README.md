@@ -7,8 +7,13 @@ A Chrome extension (Manifest V3) that scrapes Facebook posts as you scroll throu
 - **Auto-scroll & scrape** — automatically scrolls down and captures posts in real-time
 - **Pause / Resume / Stop** — full control over scraping sessions; resume picks up where you left off
 - **Auto-retry on stall** — if scrolling stalls (e.g. Facebook throttles loading), automatically retries up to 5 times before stopping
+- **Soft reset** — after retry exhaustion, automatically pauses then restarts (up to 3 times) before giving up; the counter resets whenever a new post is captured
 - **Scroll-back recovery** — detects and recovers from Facebook's virtualized feed scroll jumps to avoid skipping posts; automatically suppresses scroll-back when advancing past fully-scraped areas
+- **DOM blackout recovery** — when the extension starves Facebook's JS engine (15s of silence with no DOM mutations), auto-pauses to let the page recover, then resumes
 - **Sleep/wake resilience** — detects MacBook sleep via wall-clock drift and gracefully recovers (resets stall counters, skips stale DOM mutations, guards against detached nodes)
+- **Full timestamp extraction** — captures exact date and time (e.g. `19 March 2026 at 15:15`) for every post, including posts from months ago, via:
+  - CSS character unscrambling for recent posts (Facebook renders timestamp chars as individual spans in a flex container; sorted by position to reconstruct the date)
+  - GraphQL XHR interception for older posts (extracts `creation_time` unix timestamps from Facebook's API responses before the page's JavaScript even runs)
 - **Image auto-download** — downloads post images to a `fb-scraper/` folder while CDN session tokens are still active
 - **Download queue** — sequential downloads with progress tracking, retry for failed downloads
 - **Two export modes**:
@@ -27,7 +32,6 @@ A Chrome extension (Manifest V3) that scrapes Facebook posts as you scroll throu
   - Strips Facebook UI noise (navigation, button labels, notification panels)
   - Handles scrambled "Sponsored" text obfuscation (including `\u00a0` non-breaking spaces)
 - **Performance at scale** — `WeakSet`-based element tracking eliminates redundant DOM walks on 10 000+ element pages; scan cost stays near-constant regardless of how many posts have been scraped
-- **Timestamp extraction** — 5-strategy approach to find timestamps from various Facebook DOM patterns, including Chinese date formats
 - Supports English and Chinese (Traditional/Simplified) Facebook interfaces
 
 ## Installation
@@ -67,7 +71,7 @@ Exported JSON contains an array of post objects:
 {
   "author": "Page or User Name",
   "postText": "Full post content...",
-  "timestamp": "2h",
+  "timestamp": "19 March 2026 at 15:15",
   "permalink": "https://www.facebook.com/page/posts/...",
   "reactions": "Like: 582 people",
   "comments": "30 comments",
@@ -84,6 +88,7 @@ The **sanitized** export additionally strips session-specific CDN parameters (`_
 
 ```
 ├── manifest.json    # Extension configuration (Manifest V3)
+├── interceptor.js   # Main-world script — XHR interception for GraphQL timestamps
 ├── content.js       # Content script — DOM scraping, auto-scroll, text extraction
 ├── background.js    # Service worker — data storage, image download queue
 ├── popup.html       # Extension popup UI
@@ -101,11 +106,21 @@ The **sanitized** export additionally strips session-specific CDN parameters (`_
 - Auto-scrolls with stall detection and auto-retry (5 retries, 3s delay each)
 - Extracts post data from Facebook's DOM (`dir="auto"` elements, permalink patterns, aria-labels)
 - Communicates with background via `chrome.runtime.sendMessage`
+- Listens for `FB_SCRAPER_CREATION_TIMES` messages from `interceptor.js` to resolve older post timestamps
+
+### Main-World Interceptor (`interceptor.js`)
+- Declared in the manifest as `"world": "MAIN"` + `"run_at": "document_start"`
+- Runs in the page's main JavaScript world before **any** of Facebook's code executes
+- Patches `XMLHttpRequest.prototype.open/send` to intercept Facebook's GraphQL API responses
+- On each `/api/graphql` response, extracts all `"creation_time"` unix timestamp values and posts them to the content script via `window.postMessage`
+- The content script builds a date-keyed map and uses it to resolve date-only timestamps (e.g. `"16 February"`) to full datetime strings (e.g. `"16 February 2026 at 09:04"`)
+- If a post is stored before the GraphQL response arrives, it is added to a pending-retry map and updated retroactively when the response arrives
 
 ### Background Service Worker (`background.js`)
 - Stores posts and download queue in `chrome.storage.local`
 - Manages sequential image download queue with pause/resume
 - Supports post replacement by permalink or author+prefix matching (for truncated text upgrades)
+- Handles `UPDATE_TIMESTAMP` messages to patch a stored post's timestamp once the full datetime becomes available from the XHR interceptor
 - Persists state across service worker restarts
 
 ### Popup (`popup.js`)
@@ -156,6 +171,12 @@ When a MacBook enters sleep mode, Chrome accumulates `setInterval` ticks and fir
 - Scroll position tracking is reset to prevent false jump detection
 - The periodic scanner and MutationObserver skip stale ticks/mutations
 - Detached DOM node guards prevent processing containers that were removed during sleep
+
+### DOM Blackout Recovery (v1.4.0)
+When the extension runs its scan loop too aggressively, it starves Facebook's JavaScript engine — the page appears frozen and no new DOM mutations arrive for an extended period. The scraper detects this by tracking the timestamp of the last DOM mutation. If 15 seconds pass with no mutations while the scraper is active, it automatically pauses, waits 3 seconds for the page to recover, then resumes. This prevents the scraper from grinding the page to a halt on very long timelines.
+
+### Soft Reset on Retry Exhaustion (v1.4.0)
+After exhausting all 5 auto-retries without finding new posts, instead of stopping permanently the scraper performs a **soft reset**: it pauses for 3 seconds then restarts the auto-scroll. Up to 3 soft resets are allowed per session. The soft reset counter resets whenever a genuinely new post is captured, so it does not count against sessions that are progressing normally but encounter occasional dry patches.
 
 ### Permalink Cleaning & Deduplication
 Facebook's `/photo/` URLs without identifying query parameters (e.g. `fbid`) are not unique permalinks — they are shared across all photo posts on a Page. The scraper rejects these generic paths and preserves identifying params (`fbid`, `story_fbid`, `v`) when cleaning URLs. Posts without unique permalinks are deduplicated via a three-layer approach:
@@ -246,11 +267,62 @@ At 300+ posts the Facebook page DOM contains 10 000+ `dir="auto"` elements. The 
 
 The MutationObserver debounce also scales: 300ms → 800ms (after 150 posts) → 1 500ms (after 300 posts) to batch the burst of mutations Facebook generates when loading new posts.
 
+### Full Timestamp Extraction (v1.5.0 + v1.6.0)
+
+Facebook does not expose plain-text timestamps directly in the DOM for most posts. Two techniques are used depending on post age:
+
+#### CSS Character Unscrambling (v1.5.0) — for recent posts
+
+Facebook renders timestamp strings as individual `<span>` leaf elements inside a flex container, with CSS `order` and `margin` properties controlling visual order. Noise characters are interleaved at a different vertical position.
+
+The scraper's `getTimestampFromLink` function:
+1. Tries `aria-labelledby` (a hidden `<span id="...">` with plain-English text, e.g. `"2 days ago"` or `"19 March at 15:15"`)
+2. Falls back to `aria-label`, then `innerText`
+3. As a last resort, performs **CSS unscrambling**:
+   - Collects all leaf `<span>` elements from the timestamp link
+   - Calls `getBoundingClientRect()` on each to get `top`, `left`, and reads CSS `order`
+   - Sorts by `top → left → CSS order` to reconstruct visual reading order
+   - Joins the characters and extracts the date prefix with a regex
+4. A relative label from `aria-labelledby` (e.g. `"2 days ago"`) is saved as a fallback; the scraper continues to attempt CSS unscrambling to recover the absolute date
+
+**Key bug fixed**: `getBoundingClientRect()` must be called once and both `rect.top` and `rect.left` stored together. An earlier version stored `left` from the rect but used a stale local variable for `top`, leaving `top: undefined` in each entry. The sort `a.top - b.top` then computed `NaN`, breaking the sort entirely and producing garbled text.
+
+#### XHR Interception for `creation_time` (v1.6.0) — for older posts
+
+For posts older than ~4 weeks, Facebook's `aria-labelledby` span contains only the date (`"16 February"`) without the time. The CSS-unscrambled text is similarly date-only for old posts. The full datetime only exists in Facebook's React/Relay store, loaded from GraphQL.
+
+**Investigation findings**:
+- Facebook uses `XMLHttpRequest` (not `fetch`) for all GraphQL calls — `window.fetch` interception captures zero requests
+- Facebook's Relay framework saves a reference to `XMLHttpRequest` at **boot time** — any patch applied after Facebook's code runs is ignored
+- The full `creation_time` unix timestamp is present in plaintext in the GraphQL JSON response body (e.g. `"creation_time":1773837477`)
+
+**Solution — `interceptor.js`**:
+
+```
+manifest.json → content_scripts:
+  { "js": ["interceptor.js"], "run_at": "document_start", "world": "MAIN" }
+```
+
+- Declared as a content script with `"world": "MAIN"` and `"run_at": "document_start"` — Chrome injects it into the page's main JavaScript world before any of Facebook's scripts execute, bypassing page CSP
+- Patches `XMLHttpRequest.prototype.open` (to record the request URL) and `XMLHttpRequest.prototype.send` (to attach a `load` listener)
+- On each GraphQL response, extracts all `"creation_time"` values and posts them to the content script via `window.postMessage({ type: 'FB_SCRAPER_CREATION_TIMES', times: [...] })`
+
+**Content script side**:
+- Listens for `FB_SCRAPER_CREATION_TIMES` messages and builds `_creationTimesByDate`: a map from date key (`"16 February"`) to an array of unix timestamps, sorted newest-first
+- When `extractTimestamp` returns a date-only string, `lookupCreationTime` matches by date and returns the full `formatCreationTime(unixTs)` string
+- **Race condition handling**: if `processPost` runs before the XHR response's `postMessage` is processed, the post is added to `_pendingTimestampPosts`. When the next batch of creation_times arrives, all pending posts are retried and an `UPDATE_TIMESTAMP` message is sent to background.js to patch the stored record retroactively
+
+**Why inline `<script>` injection fails**: Facebook's CSP blocks inline scripts injected via `document.createElement('script')`. The `"world": "MAIN"` manifest approach bypasses CSP because Chrome itself injects the script, not the page.
+
+**Why `document_idle` is too late**: Even if CSP were not a concern, injecting at `document_idle` (after the page has loaded) means Facebook's Relay framework has already saved its XHR reference. Patching `XMLHttpRequest.prototype` at that point has no effect on in-flight or future Relay requests.
+
 ### Key Architectural Insights
 1. **Work WITH Facebook's virtualization, not against it**: Use `scrollBy` (relative) rather than `scrollTo` (absolute). Let Facebook manage its DOM window, but recover when it jumps.
 2. **The virtual window is ~3000-4000px**: Facebook keeps roughly this much content rendered. Scroll jumps of similar magnitude confirm this — they represent the entire window shifting.
 3. **`clickSeeMore` is the trigger**: The DOM expansion from clicking "See more" triggers the virtualization reorganization.
 4. **Failed approaches**: Using `scrollTo` with absolute targets fights the virtualization. Pause-only on jump detection (no scroll-back) leaves the page past missed posts. Reducing scroll speed doesn't help — the jumps are caused by DOM changes, not scroll speed.
+5. **Facebook uses XHR not fetch**: Despite being a modern React/Relay application, Facebook's data layer uses `XMLHttpRequest` for GraphQL calls. `window.fetch` interception captures zero of these requests.
+6. **`document_start` is mandatory for XHR patching**: Relay saves its XHR reference at module initialization, which runs during page load — before `document_idle`. Any interceptor installed after the page has begun executing will be silently ignored by Relay.
 
 ## Limitations
 
@@ -258,7 +330,7 @@ The MutationObserver debounce also scales: 300ms → 800ms (after 150 posts) →
 - Video links are page URLs, not direct media files (Facebook does not expose raw video URLs in the DOM)
 - Image URLs from Facebook CDN require active session tokens — images are auto-downloaded during scraping to avoid expiry
 - Facebook DOM structure may change, which could break selectors
-- Timestamp extraction depends on Facebook's DOM patterns; some posts may have missing timestamps depending on the page layout
+- Some older posts may show only a date without a time (e.g. `"16 February"`) if the GraphQL feed response for that scroll position did not include `creation_time` (e.g. the response was not captured before the post was processed)
 - Auto-scroll may stall on very long timelines; the extension auto-retries but may eventually stop
 - **Post ordering**: Posts may occasionally appear out of order in the CSV due to timing differences between the main scan and the third-pass photo-only detection
 - **Posts deep in the feed** may be missed if Facebook's virtualized feed removes them from the DOM before the scanner processes them
