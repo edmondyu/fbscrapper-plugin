@@ -24,8 +24,8 @@
   // Map from date key ("16 February") to sorted array of unix timestamps (newest first)
   // populated by intercepting Facebook's GraphQL feed responses.
   const _creationTimesByDate = new Map();
-  const SCAN_INTERVAL = 1200;
-  const SCROLL_INTERVAL = 1500;
+  const SCAN_INTERVAL = 900;
+  const SCROLL_INTERVAL = 1000;
 
   // Posts that were saved with a date-only timestamp and need a retry once
   // creation_time data arrives from the GraphQL response.
@@ -331,10 +331,11 @@
     postText = postText.replace(/\s*[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s*$/gm, '').trim();
     postText = postText.replace(/\s+[a-zA-Z0-9]{2,15}\.(com|net|org|me|io|co)\s+/g, '\n').trim();
 
-    // Strip m.me fragments (Messenger links) — standalone, trailing, or inline
-    postText = postText.replace(/^m\.me\s*$/gm, '').trim();
-    postText = postText.replace(/\s*m\.me\s*$/gm, '').trim();
-    postText = postText.replace(/\s+m\.me\s+/g, '\n').trim();
+    // Strip m.me fragments (Messenger links) — standalone, trailing, or inline.
+    // Handles bare "m.me" and paths like "m.me/pagename".
+    postText = postText.replace(/^m\.me(\/\S*)?\s*$/gm, '').trim();
+    postText = postText.replace(/\s*m\.me(\/\S*)?\s*$/gm, '').trim();
+    postText = postText.replace(/\s+m\.me(\/\S*)?\s+/g, '\n').trim();
 
     // Strip page header noise: "PageName Personal blog Send message" or
     // "PageName Public figure Message" trailing on a post title line.
@@ -1010,8 +1011,8 @@
         if (link) break;
       }
       if (!postParent || seenContainers.has(postParent)) continue;
-      // Extract permalink and check if already captured
-      const { permalink } = extractTimestamp(postParent);
+      // Use cheap href-only scan instead of full extractTimestamp for dedup check.
+      const permalink = quickPermalink(postParent);
       if (!permalink || processedPermalinks.has(permalink)) continue;
       // This is a genuinely missed post — process it
       seenContainers.add(postParent);
@@ -1158,9 +1159,11 @@
 
   function processPost(container) {
     if (!isActive) return;
-    // Click "See more" to expand, then extract after delay
+    // Click "See more" to expand, then extract after delay.
+    // 200ms is sufficient for most expansions; the RetryA chain (at 2s) handles
+    // slow XHR-backed expansions without requiring a longer initial wait.
     const clicked = clickSeeMore(container);
-    const delay = clicked ? 400 : 0;
+    const delay = clicked ? 200 : 0;
 
     // Pre-capture permalink href before the timeout using a cheap href-only scan
     // (no innerText/layout reflows). If Facebook re-renders the post container
@@ -1421,7 +1424,7 @@
       // layout-reflow bursts that freeze the UI when many posts are processed.
       if (clicked && !isReplacement) {
         const retryPrefixKey = prefixKey;
-        const jitter = Math.floor(Math.random() * 400);
+        const jitter = Math.floor(Math.random() * 150);
         setTimeout(() => {
           // Re-find the container if detached (Facebook re-rendering)
           let retryContainer = activeContainer;
@@ -1715,8 +1718,9 @@
         }
       }
 
-      // Constant scroll speed — avoid acceleration that skips posts
-      window.scrollBy({ top: 400, behavior: 'smooth' });
+      // Constant scroll speed — avoid acceleration that skips posts.
+      // 500px per 1000ms tick = 500px/s; scroll-back handles any FB jump > 800px.
+      window.scrollBy({ top: 500, behavior: 'smooth' });
     }, SCROLL_INTERVAL);
   }
 

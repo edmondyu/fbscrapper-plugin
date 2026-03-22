@@ -1,0 +1,25 @@
+<!-- Synthetic fixture: older post where timestamp link shows a date-only string.
+     Tests that "16 February" is recognised as a valid timestamp (no time component).
+     The aria-labelledby pattern uses a hidden span holding the date string,
+     matched by the absolute-date check in getTimestampFromLink. -->
+<div id="post-container">
+  <!-- Hidden label element used by aria-labelledby on the timestamp span -->
+  <span id="ts-label-456" style="display:none">16 February</span>
+  <div>
+    <strong><a href="/pagename">Page Name</a></strong>
+    <!-- Timestamp link: obfuscated href, child span holds aria-labelledby ref -->
+    <a href="?__cft__[0]=oldpost">
+      <span aria-labelledby="ts-label-456"></span>
+    </a>
+    <!-- Permalink link -->
+    <a href="/posts/oldpost789">16 February</a>
+  </div>
+  <div>
+    <div dir="auto">This is an older post content from February with no time component in the timestamp.</div>
+  </div>
+  <div>
+    <div dir="auto">Like</div>
+    <div dir="auto">Comment</div>
+    <div dir="auto">Share</div>
+  </div>
+</div>

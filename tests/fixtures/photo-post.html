@@ -1,0 +1,22 @@
+<!-- Synthetic fixture: photo post with garbage noise that filters should strip.
+     Includes: scrambled FB code, m.me/path link, "Photos from X's post".
+     Noise appears AFTER the caption (matching real Facebook DOM ordering). -->
+<div id="post-container">
+  <div>
+    <h3>Jane Smith</h3>
+    <a href="/posts/photo456">3d</a>
+  </div>
+  <div>
+    <!-- Photo caption — the real content (appears first) -->
+    <div dir="auto">Beautiful sunset at the beach today!</div>
+    <!-- Scrambled FB obfuscation code — should be stripped -->
+    <div dir="auto">aBcDeF1234567890ghiJklMnOpQr</div>
+    <!-- m.me Messenger shortlink with path — should be stripped -->
+    <div dir="auto">m.me/janesmith</div>
+  </div>
+  <div>
+    <div dir="auto">Like</div>
+    <div dir="auto">Comment</div>
+    <div dir="auto">Share</div>
+  </div>
+</div>
