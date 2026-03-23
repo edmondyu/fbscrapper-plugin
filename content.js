@@ -27,6 +27,21 @@
   const SCAN_INTERVAL = 900;
   const SCROLL_INTERVAL = 1000;
 
+  // Cached dir="auto" element count from last scan — used to scale throttle/debounce
+  // with DOM size (spam-heavy pages can have 5000+ matching elements).
+  let _lastDirAutoCount = 0;
+  // Highest scrollY reached — persisted to storage so the scraper can resume from
+  // the same position after a page blank-out or manual reload.
+  let _scrollHighWaterMark = 0;
+  let _lastPersistedWatermark = 0;
+  // Fast-forward mode: scroll at 4× speed through already-scraped content until we
+  // reach the previous session's watermark, then drop back to normal speed.
+  let _fastForwardMode = false;
+  let _resumeTargetWatermark = 0;
+  // DOM silence detector state
+  let _silenceInterval = null;
+  let _lastMutationTime = Date.now();
+
   // Posts that were saved with a date-only timestamp and need a retry once
   // creation_time data arrives from the GraphQL response.
   // Map: permalink -> rawDate (e.g. "16 February")
@@ -992,7 +1007,11 @@
     // noticeably heavier, even with textContent.  Before 150 posts scans are
     // fast enough that no throttle is needed.
     const nowScan = Date.now();
-    const minScanGap = processedHashes.size > 150 ? 2000 : 0;
+    // DOM-size-aware throttle: large DOM (from spam-heavy pages) → less frequent scans.
+    // _lastDirAutoCount is updated at the end of each scan so the NEXT scan uses it.
+    const minScanGap = _lastDirAutoCount > 3000 ? 5000 :
+                       _lastDirAutoCount > 1000 ? 3000 :
+                       processedHashes.size > 150 ? 2000 : 0;
     if (nowScan - _lastScanTime < minScanGap) return;
     _lastScanTime = nowScan;
 
@@ -1185,6 +1204,9 @@
       console.log('[FB Scraper] Third pass: processing photo-only post candidate');
       processPost(container);
     }
+
+    // Cache element count for next scan's throttle/debounce calculation
+    _lastDirAutoCount = allDirAuto.length;
   }
 
   // Cheap permalink extraction — reads only href attributes, no innerText/layout reflows.
@@ -1254,16 +1276,18 @@
 
   function processPost(container) {
     if (!isActive) return;
-    // Click "See more" to expand, then extract after delay.
-    // 200ms is sufficient for most expansions; the RetryA chain (at 2s) handles
-    // slow XHR-backed expansions without requiring a longer initial wait.
-    const clicked = clickSeeMore(container);
-    const delay = clicked ? 200 : 0;
 
-    // Pre-capture permalink href before the timeout using a cheap href-only scan
-    // (no innerText/layout reflows). If Facebook re-renders the post container
-    // during the expansion delay, we can re-find it by this href.
+    // Pre-capture permalink href before any DOM mutation.
+    // Used both to skip redundant See More clicks and to re-find detached containers.
     const prePermalink = quickPermalink(container);
+
+    // Skip See More if this post was already captured with substantial text.
+    // Facebook re-renders virtualized posts in fresh DOM nodes — these will
+    // pass the WeakSet/fbScraperDone check (new node) but already have good text.
+    // Skipping the click saves DOM mutations and avoids CPU spikes on spam pages.
+    const prevCapturedLen = prePermalink ? (processedPermalinks.get(prePermalink) || 0) : 0;
+    const clicked = prevCapturedLen >= 100 ? false : clickSeeMore(container);
+    const delay = clicked ? 200 : 0;
 
     setTimeout(() => {
       // Guard: if scraping was stopped during the delay, abort
@@ -1727,15 +1751,26 @@
   window.addEventListener('scroll', () => {
     if (!isActive) { _prevScrollY = window.scrollY; return; }
     const curY = window.scrollY;
+
+    // Track the highest scroll position reached for resume-after-blank-out.
+    // Persist to storage when it grows by >5000px to survive page reloads.
+    if (curY > _scrollHighWaterMark) {
+      _scrollHighWaterMark = curY;
+      if (_scrollHighWaterMark - _lastPersistedWatermark > 5000) {
+        _lastPersistedWatermark = _scrollHighWaterMark;
+        chrome.storage.local.set({ scrollHighWaterMark: _scrollHighWaterMark });
+      }
+    }
+
     const delta = curY - _prevScrollY;
     if (delta > 800) {
       // Large forward jump — scan immediately
       scanForPosts();
 
-      // Only scroll back if recent scans are finding new posts.
-      // If we've had several empty scans, the current area is fully scraped
-      // and scroll-back would trap us in a loop.
-      if (_consecutiveEmptyScans < SCROLL_BACK_SUPPRESS_THRESHOLD) {
+      // Suppress scroll-back during fast-forward — we're intentionally jumping
+      // through already-scraped content and don't need to re-traverse it.
+      // Also suppress when recent scans are finding nothing new.
+      if (!_fastForwardMode && _consecutiveEmptyScans < SCROLL_BACK_SUPPRESS_THRESHOLD) {
         console.log('[FB Scraper] Scroll jump +' + delta + ', scanning & scrolling back');
         _scrollBackTarget = _prevScrollY;
         requestAnimationFrame(() => {
@@ -1775,6 +1810,23 @@
         lastDocHeight = document.documentElement.scrollHeight;
         _prevScrollY = window.scrollY; // prevent false scroll-jump detection
         return; // skip this tick, let Facebook stabilize
+      }
+
+      // Fast-forward through already-scraped content at 4× speed.
+      // Runs BEFORE stall detection — during fast-forward we expect no new posts
+      // (all deduped) so stall counters must not fire.
+      if (_fastForwardMode) {
+        if (window.scrollY >= _resumeTargetWatermark - 2000) {
+          _fastForwardMode = false;
+          // Reset stall baseline so normal scraping starts with a clean slate
+          stallCount = 0;
+          lastPostCount = processedHashes.size;
+          lastDocHeight = document.documentElement.scrollHeight;
+          console.log('[FB Scraper] Fast-forward complete at scrollY:', Math.round(window.scrollY), '— switching to normal scan');
+        } else {
+          window.scrollBy({ top: 2000, behavior: 'instant' });
+          return; // skip stall detection entirely during fast-forward
+        }
       }
 
       const currentCount = processedHashes.size;
@@ -1820,8 +1872,8 @@
         }
       }
 
-      // Constant scroll speed — avoid acceleration that skips posts.
-      // 500px per 1000ms tick = 500px/s; scroll-back handles any FB jump > 800px.
+      // Normal scroll speed — 500px per 1000ms tick.
+      // scroll-back handles any FB jump > 800px.
       window.scrollBy({ top: 500, behavior: 'smooth' });
     }, SCROLL_INTERVAL);
   }
@@ -1835,6 +1887,23 @@
     await restoreStateFromStorage();
     _lastCapturedCount = processedHashes.size;
 
+    // Restore scroll watermark and jump to where we left off.
+    // This lets the scraper resume after a blank-out or manual page reload
+    // without re-scanning from the top.
+    await new Promise((resolve) => {
+      chrome.storage.local.get({ scrollHighWaterMark: 0 }, (r) => {
+        const saved = r.scrollHighWaterMark || 0;
+        if (saved > 1000) {
+          _scrollHighWaterMark = saved;
+          _lastPersistedWatermark = saved;
+          _resumeTargetWatermark = saved;
+          _fastForwardMode = true;
+          console.log('[FB Scraper] Fast-forward mode: will scroll at 4× speed until watermark', saved, 'px');
+        }
+        resolve();
+      });
+    });
+
     // Resume downloads in background
     chrome.runtime.sendMessage({ type: 'RESUME_DOWNLOADS' });
 
@@ -1847,6 +1916,7 @@
       const now = Date.now();
       const gap = now - mutationLastTime;
       mutationLastTime = now;
+      _lastMutationTime = now; // update for silence detector
 
       // Skip burst of mutations after wake — DOM is stale
       if (gap > 10000) {
@@ -1855,15 +1925,30 @@
       }
 
       // Debounce: don't scan on every tiny mutation.
-      // Scale up with post count — larger DOM means more mutations and
-      // more expensive scans (even with the WeakSet, the querySelectorAll
-      // itself grows with the page).
-      const debounceMs = processedHashes.size > 300 ? 1500 : processedHashes.size > 150 ? 800 : 300;
+      // Scale up with DOM element count (spam-heavy pages) and post count.
+      const debounceMs = _lastDirAutoCount > 3000 ? 3000 :
+                         processedHashes.size > 300 ? 1500 :
+                         processedHashes.size > 150 ? 800 : 300;
       clearTimeout(observer._debounce);
       observer._debounce = setTimeout(scanForPosts, debounceMs);
     });
 
     observer.observe(document.body, { childList: true, subtree: true });
+
+    // DOM silence detector: if the feed stops mutating for 15s while still active
+    // and not at the bottom, nudge the scroll to unblock Facebook's infinite scroll.
+    _lastMutationTime = Date.now();
+    _silenceInterval = setInterval(() => {
+      if (!isActive) return;
+      const silence = Date.now() - _lastMutationTime;
+      const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 200;
+      if (silence > 15000 && !atBottom) {
+        console.log('[FB Scraper] 15s DOM silence detected, nudging scroll to unblock feed...');
+        window.scrollBy({ top: -300, behavior: 'smooth' });
+        setTimeout(() => window.scrollBy({ top: 500, behavior: 'smooth' }), 600);
+        _lastMutationTime = Date.now(); // prevent rapid re-nudging
+      }
+    }, 5000);
 
     // Periodic fallback scanner (with wake detection)
     let scanLastTickTime = Date.now();
@@ -1902,6 +1987,10 @@
     if (autoScrollInterval) {
       clearInterval(autoScrollInterval);
       autoScrollInterval = null;
+    }
+    if (_silenceInterval) {
+      clearInterval(_silenceInterval);
+      _silenceInterval = null;
     }
     stallCount = 0;
     autoRetryCount = 0;

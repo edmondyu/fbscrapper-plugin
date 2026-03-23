@@ -297,7 +297,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'CLEAR_POSTS') {
-    chrome.storage.local.set({ posts: [], downloadQueue: [] }, () => {
+    chrome.storage.local.set({ posts: [], downloadQueue: [], scrollHighWaterMark: 0 }, () => {
       isPaused = false;
       sendResponse({ ok: true });
     });
