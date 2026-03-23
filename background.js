@@ -142,6 +142,12 @@ async function enqueueVideos(postIndex, videos) {
     const url = videos[i];
     if (downloadQueue.some(q => q.url === url)) continue;
 
+    // Only download direct CDN media — skip Facebook page/watch URLs
+    // (e.g. facebook.com/videos/...) which would download an HTML page.
+    const isCdnMedia = url.includes('fbcdn.net') || url.includes('.mp4') ||
+                       url.includes('.webm') || url.includes('t15.5256');
+    if (!isCdnMedia) continue;
+
     // Determine extension: MP4 for actual videos, jpg for thumbnails (t15.5256)
     let ext = 'jpg';
     if (url.includes('.mp4')) ext = 'mp4';
