@@ -1009,8 +1009,9 @@
     const nowScan = Date.now();
     // DOM-size-aware throttle: large DOM (from spam-heavy pages) → less frequent scans.
     // _lastDirAutoCount is updated at the end of each scan so the NEXT scan uses it.
-    const minScanGap = _lastDirAutoCount > 3000 ? 5000 :
-                       _lastDirAutoCount > 1000 ? 3000 :
+    const minScanGap = _lastDirAutoCount > 10000 ? 8000 :
+                       _lastDirAutoCount > 3000  ? 5000 :
+                       _lastDirAutoCount > 1000  ? 3000 :
                        processedHashes.size > 150 ? 2000 : 0;
     if (nowScan - _lastScanTime < minScanGap) return;
     _lastScanTime = nowScan;
@@ -1099,6 +1100,14 @@
       // Log skip reasons when approaching stall to diagnose why nothing is found
       console.log(`[FB Scraper] Scan found 0 new containers (stall: ${stallCount}/${MAX_STALL}) | emptyScanStreak: ${_consecutiveEmptyScans} | dirAuto: ${allDirAuto.length} | skips: short=${skipReasons.short} ui=${skipReasons.ui} noContainer=${skipReasons.noContainer} seen=${skipReasons.seen} done=${skipReasons.done} checked=${skipReasons.checked} nested=${skipReasons.nested}`);
     }
+
+    // Second and third passes are edge-case recovery (orphan posts, photo-only posts).
+    // On large DOM pages (spam-heavy feeds with 60k+ dir="auto" elements), each pass
+    // calls textContent.trim() on every element with no WeakSet short-circuit,
+    // blocking the main thread for hundreds of ms and starving Facebook's render pipeline.
+    // Skip both passes when the DOM exceeds the threshold — first-pass + WeakSet handles
+    // the overwhelming majority of posts and the performance gain outweighs the <1% miss rate.
+    if (_lastDirAutoCount <= 5000) {
 
     // Second pass: look for dir="auto" elements with substantial text that
     // the main pipeline missed (findPostContainer returned null because all
@@ -1204,6 +1213,8 @@
       console.log('[FB Scraper] Third pass: processing photo-only post candidate');
       processPost(container);
     }
+
+    } // end: if (_lastDirAutoCount <= 5000) — skip recovery passes on large DOM
 
     // Cache element count for next scan's throttle/debounce calculation
     _lastDirAutoCount = allDirAuto.length;
@@ -1707,31 +1718,43 @@
     }, delay);
   }
 
-  // Restore processedHashes from storage so resumed sessions skip already-scraped posts
+  // Restore processedHashes from storage so resumed sessions skip already-scraped posts.
+  // Also loads the compact archivedPermalinks index so archived posts are not re-scraped
+  // even after their full data was removed from chrome.storage.local.
   function restoreStateFromStorage() {
     return new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: 'GET_POSTS' }, (res) => {
-        if (res && res.posts) {
-          const PREFIX_LEN = 40;
-          for (const post of res.posts) {
-            const author = post.author || '';
-            const text = post.postText || '';
-            const key = hashString(author + text);
-            processedHashes.add(key);
-            if (post.permalink) {
-              const len = text.length;
-              const prev = processedPermalinks.get(post.permalink) || 0;
-              if (len > prev) processedPermalinks.set(post.permalink, len);
-            }
-            // Restore prefix dedup state
-            const prefixKey = hashString(author + text.substring(0, PREFIX_LEN));
-            const existing = processedPrefixes.get(prefixKey);
-            if (!existing || text.length > existing.textLength) {
-              processedPrefixes.set(prefixKey, { textLength: text.length, hash: key });
-            }
-          }
-          console.log('[FB Scraper] Restored', processedHashes.size, 'hashes,', processedPermalinks.size, 'permalinks,', processedPrefixes.size, 'prefixes from storage');
+      // Load both current posts and the archived permalink index in one call
+      chrome.storage.local.get({ posts: [], archivedPermalinks: [] }, (result) => {
+        const PREFIX_LEN = 40;
+
+        // Archived posts: only permalink known; use sentinel length so they're
+        // never replaced (any re-encountered capture will be shorter).
+        for (const permalink of (result.archivedPermalinks || [])) {
+          if (permalink) processedPermalinks.set(permalink, 99999);
         }
+
+        // Current (non-archived) posts: full dedup state
+        for (const post of (result.posts || [])) {
+          const author = post.author || '';
+          const text = post.postText || '';
+          const key = hashString(author + text);
+          processedHashes.add(key);
+          if (post.permalink) {
+            const len = text.length;
+            const prev = processedPermalinks.get(post.permalink) || 0;
+            if (len > prev) processedPermalinks.set(post.permalink, len);
+          }
+          const prefixKey = hashString(author + text.substring(0, PREFIX_LEN));
+          const existing = processedPrefixes.get(prefixKey);
+          if (!existing || text.length > existing.textLength) {
+            processedPrefixes.set(prefixKey, { textLength: text.length, hash: key });
+          }
+        }
+
+        console.log('[FB Scraper] Restored', processedHashes.size, 'hashes,',
+          processedPermalinks.size, 'permalinks (incl.',
+          (result.archivedPermalinks || []).length, 'archived),',
+          processedPrefixes.size, 'prefixes');
         resolve();
       });
     });
@@ -1926,14 +1949,19 @@
 
       // Debounce: don't scan on every tiny mutation.
       // Scale up with DOM element count (spam-heavy pages) and post count.
-      const debounceMs = _lastDirAutoCount > 3000 ? 3000 :
+      const debounceMs = _lastDirAutoCount > 10000 ? 5000 :
+                         _lastDirAutoCount > 3000  ? 3000 :
                          processedHashes.size > 300 ? 1500 :
                          processedHashes.size > 150 ? 800 : 300;
       clearTimeout(observer._debounce);
       observer._debounce = setTimeout(scanForPosts, debounceMs);
     });
 
-    observer.observe(document.body, { childList: true, subtree: true });
+    // Scope the observer to the feed container when available — observing just
+    // the feed element instead of the full body dramatically reduces mutation
+    // events from the sidebar, navbar, and notifications on large DOM pages.
+    const feedRoot = document.querySelector('div[role="feed"]') || document.body;
+    observer.observe(feedRoot, { childList: true, subtree: true });
 
     // DOM silence detector: if the feed stops mutating for 15s while still active
     // and not at the bottom, nudge the scroll to unblock Facebook's infinite scroll.

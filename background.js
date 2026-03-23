@@ -1,6 +1,64 @@
 let isProcessing = false;
 let isPaused = false;
 
+// Auto-archive: when stored posts reach a multiple of this count, the oldest
+// batch is downloaded to disk and removed from chrome.storage.local to keep
+// storage reads/writes fast and prevent the service worker from growing unboundedly.
+const ARCHIVE_EVERY = 200;
+
+// Download an array of posts as a JSON file into the scraper folder.
+async function downloadArchiveBatch(postsToArchive, batchNum) {
+  const { downloadFolder = 'fb-scraper' } = await chrome.storage.local.get('downloadFolder');
+  const folder = downloadFolder || 'fb-scraper';
+  const date = new Date().toISOString().slice(0, 10);
+  const filename = `${folder}/archive-${date}-batch-${batchNum}.json`;
+  const json = JSON.stringify(postsToArchive, null, 2);
+
+  // Use Blob + createObjectURL (available in Chrome extension service workers).
+  // Falls back to a data URL if createObjectURL is unavailable.
+  let url;
+  let needsRevoke = false;
+  try {
+    const blob = new Blob([json], { type: 'application/json' });
+    url = URL.createObjectURL(blob);
+    needsRevoke = true;
+  } catch (_) {
+    url = 'data:application/json;charset=utf-8,' + encodeURIComponent(json);
+  }
+
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download({ url, filename, conflictAction: 'uniquify' }, (downloadId) => {
+      if (needsRevoke) URL.revokeObjectURL(url);
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(downloadId);
+      }
+    });
+  });
+}
+
+// After a successful archive download: remove the oldest ARCHIVE_EVERY posts from
+// storage and append their permalinks to the compact dedup index so restarts
+// don't re-scrape archived content.
+async function commitArchive(archivedPosts) {
+  const { posts = [], archivedPermalinks = [] } = await chrome.storage.local.get(['posts', 'archivedPermalinks']);
+  const newPermalinks = archivedPosts.map(p => p.permalink).filter(Boolean);
+  const remaining = posts.slice(archivedPosts.length);
+  // Re-number postIndex in download queue to match the shifted array
+  const shift = archivedPosts.length;
+  const { downloadQueue = [] } = await chrome.storage.local.get('downloadQueue');
+  for (const item of downloadQueue) {
+    if (typeof item.postIndex === 'number') item.postIndex -= shift;
+  }
+  await chrome.storage.local.set({
+    posts: remaining,
+    archivedPermalinks: [...new Set([...archivedPermalinks, ...newPermalinks])],
+    downloadQueue,
+  });
+  console.log(`[FB Scraper] Archive committed: ${archivedPosts.length} posts removed from storage, ${remaining.length} remain`);
+}
+
 // Serialize post storage writes to prevent race conditions
 const postQueue = [];
 let isStoringPost = false;
@@ -19,6 +77,18 @@ async function drainPostQueue() {
       await enqueueImages(postIndex, post.images);
       await enqueueVideos(postIndex, post.videos);
       resolve({ ok: true, count: posts.length });
+
+      // Auto-archive when a batch boundary is reached
+      if (posts.length % ARCHIVE_EVERY === 0) {
+        const batchNum = Math.floor(posts.length / ARCHIVE_EVERY);
+        const postsToArchive = posts.slice(0, ARCHIVE_EVERY);
+        try {
+          await downloadArchiveBatch(postsToArchive, batchNum);
+          await commitArchive(postsToArchive);
+        } catch (err) {
+          console.error('[FB Scraper] Auto-archive failed (posts kept in storage):', err.message);
+        }
+      }
     }
   } finally {
     isStoringPost = false;
@@ -297,7 +367,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'CLEAR_POSTS') {
-    chrome.storage.local.set({ posts: [], downloadQueue: [], scrollHighWaterMark: 0 }, () => {
+    chrome.storage.local.set({ posts: [], downloadQueue: [], scrollHighWaterMark: 0, archivedPermalinks: [] }, () => {
       isPaused = false;
       sendResponse({ ok: true });
     });
