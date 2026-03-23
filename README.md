@@ -1,6 +1,6 @@
 # Facebook Post Scraper
 
-A Chrome extension (Manifest V3) that scrapes Facebook posts as you scroll through your feed or a Page timeline. Captures post content, author, timestamp, permalink, reactions, comments, images, and video links. Images are automatically downloaded while session tokens are still valid.
+A Chrome extension (Manifest V3) that scrapes Facebook posts as you scroll through your feed or a Page timeline. Captures post content, author, timestamp, permalink, reactions, comments, images, and videos. Images and videos are automatically downloaded while session tokens are still valid.
 
 ## Features
 
@@ -15,6 +15,7 @@ A Chrome extension (Manifest V3) that scrapes Facebook posts as you scroll throu
   - CSS character unscrambling for recent posts (Facebook renders timestamp chars as individual spans in a flex container; sorted by position to reconstruct the date)
   - GraphQL XHR interception for older posts (extracts `creation_time` unix timestamps from Facebook's API responses before the page's JavaScript even runs)
 - **Image auto-download** — downloads post images to a `fb-scraper/` folder while CDN session tokens are still active
+- **Video auto-download** — for inline (native) Facebook video posts, captures the actual MP4 file (HD 720p where available) by intercepting the GraphQL video delivery response; falls back to downloading the poster thumbnail when no MP4 is available
 - **Download queue** — sequential downloads with progress tracking, retry for failed downloads
 - **Two export modes**:
   - **Export JSON** — raw post data
@@ -112,7 +113,9 @@ The **sanitized** export additionally strips session-specific CDN parameters (`_
 - Declared in the manifest as `"world": "MAIN"` + `"run_at": "document_start"`
 - Runs in the page's main JavaScript world before **any** of Facebook's code executes
 - Patches `XMLHttpRequest.prototype.open/send` to intercept Facebook's GraphQL API responses
-- On each `/api/graphql` response, extracts all `"creation_time"` unix timestamp values and posts them to the content script via `window.postMessage`
+- On each `/api/graphql` response:
+  - Extracts all `"creation_time"` unix timestamp values and posts them to the content script via `window.postMessage({ type: 'FB_SCRAPER_CREATION_TIMES', ... })`
+  - Extracts MP4 video URLs by matching `first_frame_thumbnail` poster URLs (which contain the video ID) to `progressive_url` entries in the same GraphQL video delivery block; posts them via `window.postMessage({ type: 'FB_SCRAPER_VIDEO_URLS', ... })`
 - The content script builds a date-keyed map and uses it to resolve date-only timestamps (e.g. `"16 February"`) to full datetime strings (e.g. `"16 February 2026 at 09:04"`)
 - If a post is stored before the GraphQL response arrives, it is added to a pending-retry map and updated retroactively when the response arrives
 
@@ -121,6 +124,7 @@ The **sanitized** export additionally strips session-specific CDN parameters (`_
 - Manages sequential image download queue with pause/resume
 - Supports post replacement by permalink or author+prefix matching (for truncated text upgrades)
 - Handles `UPDATE_TIMESTAMP` messages to patch a stored post's timestamp once the full datetime becomes available from the XHR interceptor
+- Handles `UPDATE_VIDEO` messages to replace a post's poster thumbnail URL with the real MP4 URL and enqueue the video download
 - Persists state across service worker restarts
 
 ### Popup (`popup.js`)
@@ -316,6 +320,28 @@ manifest.json → content_scripts:
 
 **Why `document_idle` is too late**: Even if CSP were not a concern, injecting at `document_idle` (after the page has loaded) means Facebook's Relay framework has already saved its XHR reference. Patching `XMLHttpRequest.prototype` at that point has no effect on in-flight or future Relay requests.
 
+### Inline Video MP4 Download (v1.9.0)
+
+Facebook inline (native) video posts use MSE/blob delivery — no direct video URL exists in the DOM. The `<video>` element has no `src` attribute; only a `poster` thumbnail URL (from the `t15.5256` CDN path) is accessible.
+
+**How MP4 URLs are extracted**:
+
+The same XHR interceptor (`interceptor.js`) that captures timestamps also intercepts the GraphQL video delivery response:
+
+1. **Collect `progressive_url` entries** — scan the GraphQL response for all `progressive_url` fields that contain `.mp4` URLs, recording their byte positions
+2. **Match via `first_frame_thumbnail`** — for each `first_frame_thumbnail` field (which contains the poster filename, e.g. `562486158_..._n.jpg`), extract the video ID from the filename and find any `progressive_url` entries that appear within 15 000 characters after it in the same response block
+3. **SD vs HD** — URLs containing `720` in the path are classified as HD (720p, ~484 kbps); others as SD (~154 kbps). The HD URL is preferred
+4. **`FB_SCRAPER_VIDEO_URLS` postMessage** — sends `{ id: videoId, sdUrl, hdUrl }` to the content script
+
+**Content script matching**:
+- When a video post is scraped, `registerVideoIds` extracts the video ID from the poster URL and registers it in `_pendingVideoIdPosts` (keyed by video ID)
+- When `FB_SCRAPER_VIDEO_URLS` arrives, the content script looks up the pending post and sends `UPDATE_VIDEO` to background.js
+- **Race condition**: if the GraphQL response arrives before the post is scraped, the URL is cached in `_receivedVideoUrls`; `registerVideoIds` checks this cache immediately and sends `UPDATE_VIDEO` as soon as the post is stored (in the `sendMessage` response callback)
+
+**Background**:
+- `UPDATE_VIDEO` handler finds the post by permalink, author+prefix, or by searching for the video ID in the stored poster URL
+- Replaces `post.videos[0]` with the MP4 URL and enqueues the download as `post-N-vid-0.mp4`
+
 ### Key Architectural Insights
 1. **Work WITH Facebook's virtualization, not against it**: Use `scrollBy` (relative) rather than `scrollTo` (absolute). Let Facebook manage its DOM window, but recover when it jumps.
 2. **The virtual window is ~3000-4000px**: Facebook keeps roughly this much content rendered. Scroll jumps of similar magnitude confirm this — they represent the entire window shifting.
@@ -327,7 +353,7 @@ manifest.json → content_scripts:
 ## Limitations
 
 - Only works on `https://www.facebook.com/*`
-- Video links are page URLs, not direct media files (Facebook does not expose raw video URLs in the DOM)
+- Inline (native) video posts capture the actual MP4 file via GraphQL interception; shared/linked videos (embedding another page's video) capture a Facebook watch URL, not a direct MP4
 - Image URLs from Facebook CDN require active session tokens — images are auto-downloaded during scraping to avoid expiry
 - Facebook DOM structure may change, which could break selectors
 - Some older posts may show only a date without a time (e.g. `"16 February"`) if the GraphQL feed response for that scroll position did not include `creation_time` (e.g. the response was not captured before the post was processed)

@@ -779,6 +779,130 @@ console.log('\n── Video extraction ──');
   }
 }
 
+// ─── Video ID extraction from poster URL ──────────────────────────────────────
+
+console.log('\n── Video ID extraction from poster URL ──');
+{
+  // Inline port of extractVideoIdFromPosterUrl (pure string logic)
+  function extractVideoIdFromPosterUrl(url) {
+    const m = url.match(/\/(\d+)_\d+_\d+_n\.jpg/);
+    return m ? m[1] : null;
+  }
+
+  assert(
+    'extractVideoIdFromPosterUrl: real poster URL returns first numeric segment',
+    extractVideoIdFromPosterUrl(
+      'https://scontent-man2-1.xx.fbcdn.net/v/t15.5256-10/562486158_1537358254361890_1921498890460885019_n.jpg'
+    ) === '562486158',
+    'expected 562486158'
+  );
+
+  assert(
+    'extractVideoIdFromPosterUrl: returns null for non-matching URL',
+    extractVideoIdFromPosterUrl('https://scontent.fbcdn.net/v/t39.30808-6/photo.jpg') === null,
+    'expected null'
+  );
+
+  assert(
+    'extractVideoIdFromPosterUrl: returns null for empty string',
+    extractVideoIdFromPosterUrl('') === null,
+    'expected null'
+  );
+}
+
+// ─── GraphQL video URL extraction (interceptor regex logic) ───────────────────
+
+console.log('\n── GraphQL video URL extraction ──');
+{
+  // Inline port of the updated interceptor regex logic:
+  // Uses first_frame_thumbnail as the linking key to associate progressive_url
+  // MP4 URLs with a poster video ID.
+  function extractVideoUrlsFromGraphQL(text) {
+    const videos = [];
+    const reProg = /"progressive_url"\s*:\s*"([^"]+)"/g;
+    const progUrls = [];
+    let mp;
+    while ((mp = reProg.exec(text)) !== null) {
+      const pu = mp[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/');
+      if (pu.includes('.mp4')) progUrls.push({ pos: mp.index, url: pu });
+    }
+    if (progUrls.length === 0) return videos;
+
+    const reThumb = /"first_frame_thumbnail"\s*:\s*"(https:[^"]+\/(\d+)_\d+_\d+[^"]+)"/g;
+    let mt;
+    while ((mt = reThumb.exec(text)) !== null) {
+      const videoId = mt[2];
+      const thumbPos = mt.index;
+      const nearby = progUrls
+        .filter(p => p.pos > thumbPos && p.pos - thumbPos < 15000)
+        .map(p => p.url);
+      if (nearby.length === 0) continue;
+      let sdU = null, hdU = null;
+      for (const u of nearby) {
+        if (u.includes('720')) hdU = u;
+        else sdU = u;
+      }
+      if (!sdU) sdU = nearby[0];
+      if (!videos.some(v => v.id === videoId)) {
+        videos.push({ id: videoId, sdUrl: sdU, hdUrl: hdU });
+      }
+    }
+    return videos;
+  }
+
+  // Helper to build a realistic minimal GraphQL fragment
+  function makeVideoNode(videoId, sdMp4, hdMp4) {
+    const thumb = `"first_frame_thumbnail":"https://scontent.example.com/t15.5256-10/${videoId}_111_222_n.jpg"`;
+    const progSd = sdMp4 ? `{"progressive_url":"${sdMp4}"}` : '';
+    const progHd = hdMp4 ? `{"progressive_url":"${hdMp4}"}` : '';
+    const progArr = [progSd, progHd].filter(Boolean).join(',');
+    return `{${thumb},"progressive_urls":[${progArr}]}`;
+  }
+
+  // SD-only node
+  {
+    const text = makeVideoNode('562486158', 'https://video.fbcdn.net/v/clip.mp4', null);
+    const videos = extractVideoUrlsFromGraphQL(text);
+    assert('GraphQL extract: SD URL captured', videos.length === 1, `got: ${JSON.stringify(videos)}`);
+    assert('GraphQL extract: correct video ID', videos[0].id === '562486158', `got: ${videos[0].id}`);
+    assert('GraphQL extract: sdUrl set', videos[0].sdUrl === 'https://video.fbcdn.net/v/clip.mp4', `got: ${videos[0].sdUrl}`);
+    assert('GraphQL extract: hdUrl null for SD-only', videos[0].hdUrl === null, `got: ${videos[0].hdUrl}`);
+  }
+
+  // SD + HD node — HD detected by "720" in URL
+  {
+    const text = makeVideoNode('111222333', 'https://video.fbcdn.net/sd.mp4', 'https://video.fbcdn.net/720p.mp4');
+    const videos = extractVideoUrlsFromGraphQL(text);
+    assert('GraphQL extract: SD+HD produces one entry', videos.length === 1, `got: ${JSON.stringify(videos)}`);
+    assert('GraphQL extract: hdUrl set for 720p', videos[0].hdUrl === 'https://video.fbcdn.net/720p.mp4', `got: ${videos[0].hdUrl}`);
+    assert('GraphQL extract: sdUrl set alongside hdUrl', videos[0].sdUrl === 'https://video.fbcdn.net/sd.mp4', `got: ${videos[0].sdUrl}`);
+  }
+
+  // Unicode-escaped forward slashes in progressive_url
+  {
+    const text = `{"first_frame_thumbnail":"https://scontent.example.com/t15.5256-10/999000111_111_222_n.jpg","progressive_urls":[{"progressive_url":"https:\\u002F\\u002Fvideo.fbcdn.net\\u002Fv\\u002Fclip.mp4"}]}`;
+    const videos = extractVideoUrlsFromGraphQL(text);
+    assert('GraphQL extract: \\u002F slashes decoded', videos.length === 1 && videos[0].sdUrl.includes('//'), `got: ${JSON.stringify(videos)}`);
+  }
+
+  // No progressive_url fields → empty
+  {
+    const text = `{"id":"123","creation_time":1700000000}`;
+    const videos = extractVideoUrlsFromGraphQL(text);
+    assert('GraphQL extract: no video fields returns []', videos.length === 0, `got: ${JSON.stringify(videos)}`);
+  }
+
+  // Two distinct video nodes in same response
+  {
+    const text = makeVideoNode('100200300', 'https://video.fbcdn.net/a.mp4', null) +
+                 makeVideoNode('400500600', 'https://video.fbcdn.net/b.mp4', null);
+    const videos = extractVideoUrlsFromGraphQL(text);
+    assert('GraphQL extract: two video nodes produce two entries', videos.length === 2, `got: ${JSON.stringify(videos)}`);
+    assert('GraphQL extract: first node ID correct', videos.some(v => v.id === '100200300'), `got: ${JSON.stringify(videos)}`);
+    assert('GraphQL extract: second node ID correct', videos.some(v => v.id === '400500600'), `got: ${JSON.stringify(videos)}`);
+  }
+}
+
 // ─── Summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n── Result: ${passed} passed, ${failed} failed ─────────────────────────────\n`);

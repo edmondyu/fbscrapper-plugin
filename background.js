@@ -17,6 +17,7 @@ async function drainPostQueue() {
       posts.push(post);
       await chrome.storage.local.set({ posts });
       await enqueueImages(postIndex, post.images);
+      await enqueueVideos(postIndex, post.videos);
       resolve({ ok: true, count: posts.length });
     }
   } finally {
@@ -43,7 +44,9 @@ async function processQueue() {
         await downloadFile(next.url, next.filename);
         next.status = 'done';
         // Record the local filename on the post object
-        await recordLocalFile(next.postIndex, next.imageIndex, next.filename);
+        if (next.imageIndex !== undefined) {
+          await recordLocalFile(next.postIndex, next.imageIndex, next.filename);
+        }
       } catch (err) {
         console.error('[FB Scraper] Download failed:', next.filename, err);
         next.status = 'failed';
@@ -128,6 +131,35 @@ async function enqueueImages(postIndex, images) {
   processQueue();
 }
 
+// Enqueue videos (thumbnails or MP4s) from a post for download
+async function enqueueVideos(postIndex, videos) {
+  if (!videos || videos.length === 0) return;
+
+  const { downloadQueue = [], downloadFolder = 'fb-scraper' } = await chrome.storage.local.get(['downloadQueue', 'downloadFolder']);
+  const folder = downloadFolder || 'fb-scraper';
+
+  for (let i = 0; i < videos.length; i++) {
+    const url = videos[i];
+    if (downloadQueue.some(q => q.url === url)) continue;
+
+    // Determine extension: MP4 for actual videos, jpg for thumbnails (t15.5256)
+    let ext = 'jpg';
+    if (url.includes('.mp4')) ext = 'mp4';
+    else if (url.includes('.webm')) ext = 'webm';
+
+    downloadQueue.push({
+      postIndex,
+      videoIndex: i,
+      url,
+      filename: `${folder}/post-${postIndex}-vid-${i}.${ext}`,
+      status: 'pending',
+    });
+  }
+
+  await chrome.storage.local.set({ downloadQueue });
+  processQueue();
+}
+
 // Record the local filename on the post's localFiles array
 async function recordLocalFile(postIndex, imageIndex, filename) {
   const { posts = [] } = await chrome.storage.local.get('posts');
@@ -159,6 +191,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (idx !== -1 && posts[idx].timestamp === msg.oldTimestamp) {
         posts[idx].timestamp = msg.newTimestamp;
         chrome.storage.local.set({ posts }, () => sendResponse({ ok: true }));
+      } else {
+        sendResponse({ ok: false });
+      }
+    });
+    return true;
+  }
+
+  if (msg.type === 'UPDATE_VIDEO') {
+    // Replace the video poster thumbnail with the actual MP4 URL extracted from GraphQL.
+    chrome.storage.local.get({ posts: [] }, async (result) => {
+      const posts = result.posts;
+      let idx = -1;
+      // Strategy 1: match by permalink
+      if (msg.permalink) {
+        idx = posts.findIndex(p => p.permalink && p.permalink === msg.permalink);
+      }
+      // Strategy 2: match by author + text prefix
+      if (idx === -1 && msg.matchPrefix && msg.matchAuthor) {
+        idx = posts.findIndex(p =>
+          p.author === msg.matchAuthor &&
+          p.postText && p.postText.substring(0, msg.matchPrefix.length) === msg.matchPrefix
+        );
+      }
+      // Strategy 3: match by poster URL containing the video ID
+      if (idx === -1 && msg.videoId) {
+        idx = posts.findIndex(p =>
+          (p.videos || []).some(v => v.includes('/' + msg.videoId + '_'))
+        );
+      }
+      if (idx !== -1) {
+        // Replace poster thumbnail(s) with the MP4 URL
+        posts[idx].videos = [msg.mp4Url];
+        await chrome.storage.local.set({ posts });
+        // Enqueue the MP4 for download (replaces any queued thumbnail for this post)
+        await enqueueVideos(idx, [msg.mp4Url]);
+        sendResponse({ ok: true });
       } else {
         sendResponse({ ok: false });
       }

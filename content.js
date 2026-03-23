@@ -32,9 +32,86 @@
   // Map: permalink -> rawDate (e.g. "16 February")
   const _pendingTimestampPosts = new Map();
 
-  // Listen for creation_time batches posted by the main-world interceptor.
+  // Map: videoId (string) -> { permalink, matchPrefix, matchAuthor }
+  // Populated when a post with a video poster URL is captured.
+  // Consumed when FB_SCRAPER_VIDEO_URLS arrives with the actual MP4 URL.
+  const _pendingVideoIdPosts = new Map();
+
+  // Cache: videoId (string) -> mp4Url
+  // Populated when FB_SCRAPER_VIDEO_URLS arrives before processPost runs.
+  // Checked immediately in registerVideoIds so the race condition is handled.
+  const _receivedVideoUrls = new Map();
+
+  // Extract the video ID from a poster URL (t15.5256 CDN).
+  // Poster filename format: "<videoId>_<otherId>_<otherId>_n.jpg"
+  // Returns the first numeric segment, or null.
+  function extractVideoIdFromPosterUrl(url) {
+    const m = url.match(/\/(\d+)_\d+_\d+_n\.jpg/);
+    return m ? m[1] : null;
+  }
+
+  // Register video IDs for a newly captured post so that when the GraphQL
+  // video URL arrives later we can match it back to this post.
+  // If the URL already arrived (race condition), sends UPDATE_VIDEO immediately.
+  function registerVideoIds(videos, permalink, matchPrefix, matchAuthor) {
+    for (const posterUrl of videos) {
+      const videoId = extractVideoIdFromPosterUrl(posterUrl);
+      if (!videoId) continue;
+      const cached = _receivedVideoUrls.get(videoId);
+      if (cached) {
+        // GraphQL already arrived — fire UPDATE_VIDEO right away
+        const msg = { type: 'UPDATE_VIDEO', videoId, mp4Url: cached };
+        if (permalink) msg.permalink = permalink;
+        if (matchPrefix) { msg.matchPrefix = matchPrefix; msg.matchAuthor = matchAuthor; }
+        chrome.runtime.sendMessage(msg).catch(() => {});
+      } else {
+        _pendingVideoIdPosts.set(videoId, { permalink, matchPrefix, matchAuthor });
+      }
+    }
+  }
+
+  // CDP test-bridge: allow main-world evaluate_script to send commands to the
+  // isolated-world content script via postMessage.
   window.addEventListener('message', function(e) {
-    if (e.source !== window || !e.data || e.data.type !== 'FB_SCRAPER_CREATION_TIMES') return;
+    if (e.source !== window || !e.data || e.data.type !== 'FB_SCRAPER_CMD') return;
+    const cmd = e.data.cmd;
+    if (cmd === 'start') { isActive = true; startObserver(); startAutoScroll(); }
+    else if (cmd === 'stop') { isActive = false; }
+    else if (cmd === 'getStorage') {
+      chrome.storage.local.get(e.data.keys || ['posts', 'downloadQueue'], function(r) {
+        window.postMessage({ type: 'FB_SCRAPER_CMD_RESULT', requestId: e.data.requestId, result: r }, '*');
+      });
+    }
+    else if (cmd === 'clearAll') {
+      chrome.storage.local.set({ posts: [], downloadQueue: [] }, function() {
+        window.postMessage({ type: 'FB_SCRAPER_CMD_RESULT', requestId: e.data.requestId, result: 'cleared' }, '*');
+      });
+    }
+  });
+
+  // Listen for creation_time batches and video URL batches from the main-world interceptor.
+  window.addEventListener('message', function(e) {
+    if (e.source !== window || !e.data) return;
+
+    // ── Video URL updates ────────────────────────────────────────────────────
+    if (e.data.type === 'FB_SCRAPER_VIDEO_URLS') {
+      for (const { id, sdUrl, hdUrl } of e.data.videos) {
+        const mp4Url = hdUrl || sdUrl;
+        if (!mp4Url) continue;
+        // Always cache so registerVideoIds can use it if processPost runs later
+        _receivedVideoUrls.set(id, mp4Url);
+        const pending = _pendingVideoIdPosts.get(id);
+        if (!pending) continue;
+        _pendingVideoIdPosts.delete(id);
+        const msg = { type: 'UPDATE_VIDEO', videoId: id, mp4Url };
+        if (pending.permalink) msg.permalink = pending.permalink;
+        if (pending.matchPrefix) { msg.matchPrefix = pending.matchPrefix; msg.matchAuthor = pending.matchAuthor; }
+        chrome.runtime.sendMessage(msg).catch(() => {});
+      }
+      return;
+    }
+
+    if (e.data.type !== 'FB_SCRAPER_CREATION_TIMES') return;
     const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
     for (const ts of e.data.times) {
       const d = new Date(ts * 1000);
@@ -1426,7 +1503,14 @@
         msg.matchPrefix = replaceMatchPrefix;
         msg.matchAuthor = author;
       }
-      chrome.runtime.sendMessage(msg);
+      chrome.runtime.sendMessage(msg, () => {
+        // Post is now confirmed stored in background — safe to send UPDATE_VIDEO
+        // without racing against the NEW_POST write.
+        if (videos.length > 0) {
+          const PREFIX_LEN = 40;
+          registerVideoIds(videos, permalink, postText.substring(0, PREFIX_LEN), author);
+        }
+      });
       console.log('[FB Scraper] Captured:', author, '|', postText.substring(0, 40) + '...');
       // If the timestamp is still date-only (creation_time not yet received), register
       // the post for a retry update when the GraphQL response arrives.
