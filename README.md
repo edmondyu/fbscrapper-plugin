@@ -353,7 +353,8 @@ The same XHR interceptor (`interceptor.js`) that captures timestamps also interc
 ## Limitations
 
 - Only works on `https://www.facebook.com/*`
-- Inline (native) video posts capture the actual MP4 file via GraphQL interception; shared/linked videos (embedding another page's video) capture a Facebook watch URL, not a direct MP4
+- **Inline (native) video posts** download the actual MP4 file via GraphQL interception
+- **Shared/linked videos** (posts that embed another page's video): only the poster thumbnail is downloaded; the Facebook watch URL is preserved in the export JSON for manual access. Facebook does not include MP4 delivery data in feed GraphQL for shared videos — it only loads when the user clicks play
 - Image URLs from Facebook CDN require active session tokens — images are auto-downloaded during scraping to avoid expiry
 - Facebook DOM structure may change, which could break selectors
 - Some older posts may show only a date without a time (e.g. `"16 February"`) if the GraphQL feed response for that scroll position did not include `creation_time` (e.g. the response was not captured before the post was processed)
